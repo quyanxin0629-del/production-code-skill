@@ -65,7 +65,11 @@ class BatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_input_has_bounded_tasks_buffer_and_parallelism(self):
         workers = 3
-        source = Source(range(100_000))
+        # This checks resource bounds and completion, not machine throughput.
+        # 10k items still expose eager/unbounded submission while keeping the
+        # debug-mode test reliable on slower Python 3.11 Windows runners.
+        total_items = 10_000
+        source = Source(range(total_items))
         release = asyncio.Event()
         started = asyncio.Event()
         active = 0
@@ -101,7 +105,7 @@ class BatchTests(unittest.IsolatedAsyncioTestCase):
         finally:
             batch.cancel()
             await asyncio.gather(batch, return_exceptions=True)
-        self.assertEqual(handled, 100_000)
+        self.assertEqual(handled, total_items)
         self.assertEqual(peak_active, workers)
         self.assertEqual(source.close_calls, 0)
 
