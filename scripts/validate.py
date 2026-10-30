@@ -1,0 +1,212 @@
+import ast
+import asyncio
+from contextvars import copy_context
+from datetime import datetime, timezone
+from decimal import Decimal
+import importlib.util
+import json
+from pathlib import Path
+import re
+import sys
+import unittest
+from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+SKILL = ROOT / 'production-code'
+REFERENCE = SKILL / 'references/defensive-and-observability.md'
+
+
+def blocks(path):
+    return re.findall(r'```python\n(.*?)\n```', path.read_text(), re.S)
+
+
+def find_block(marker, path=REFERENCE):
+    matches = [block for block in blocks(path) if marker in block]
+    if len(matches) != 1:
+        raise AssertionError((marker, len(matches)))
+    return matches[0]
+
+
+NAMESPACE = {}
+for marker in ['def parse_cny', 'def allocate_fen', 'def as_utc', 'def local_to_utc_strict']:
+    exec(compile(find_block(marker), str(REFERENCE), 'exec'), NAMESPACE)
+JSON_NS = {'bounded_body': '{}', 'response_dto': {}}
+exec(compile(find_block('def finite_json_float'), str(REFERENCE), 'exec'), JSON_NS)
+MODEL_NS = {}
+exec(compile(find_block('class CreateOrder(BaseModel)'), str(REFERENCE), 'exec'), MODEL_NS)
+CONTEXT_NS = {}
+exec(compile(find_block('class RequestContextMiddleware'), str(REFERENCE), 'exec'), CONTEXT_NS)
+
+
+class ArtifactTests(unittest.TestCase):
+    def test_metadata(self):
+        content = (SKILL / 'SKILL.md').read_text()
+        metadata = yaml.safe_load(content.split('---', 2)[1])
+        self.assertEqual(metadata['name'], 'production-code')
+        self.assertTrue(metadata['description'])
+        interface = yaml.safe_load((SKILL / 'agents/openai.yaml').read_text())['interface']
+        self.assertIn('$production-code', interface['default_prompt'])
+        self.assertGreaterEqual(len(interface['short_description']), 25)
+        self.assertLessEqual(len(interface['short_description']), 64)
+
+    def test_markdown_and_local_links(self):
+        files = list(SKILL.rglob('*.md'))
+        self.assertEqual(len(files), 9)
+        for file in files:
+            with self.subTest(file=file.name):
+                content = file.read_text()
+                fences = re.findall(r'^```.*$', content, re.M)
+                self.assertEqual(len(fences) % 2, 0)
+                self.assertNotIn('[TODO:', content)
+                for target in re.findall(r'\]\(([^)]+)\)', content):
+                    parsed = urlsplit(target)
+                    if parsed.scheme or not parsed.path:
+                        continue
+                    resolved = (file.parent / unquote(parsed.path)).resolve()
+                    self.assertTrue(resolved.is_relative_to(SKILL.resolve()), target)
+                    self.assertTrue(resolved.is_file(), target)
+
+    def test_python_fences_parse(self):
+        count = 0
+        for file in SKILL.rglob('*.md'):
+            for index, block in enumerate(blocks(file), 1):
+                with self.subTest(file=file.name, block=index):
+                    ast.parse(block, filename=f'{file.name}:{index}')
+                count += 1
+        self.assertGreater(count, 35)
+
+
+class DefensiveTests(unittest.TestCase):
+    def test_money_exact_and_range(self):
+        parse = NAMESPACE['parse_cny']
+        self.assertEqual(parse('19.99'), Decimal('19.99'))
+        self.assertEqual(parse('0'), Decimal('0.00'))
+        self.assertEqual(parse('999999999999.99'), Decimal('999999999999.99'))
+        for value in ['NaN', 'Infinity', '1e3', '-1', '01', '1.999', '1000000000000', 19.99, True]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse(value)
+
+    def test_allocation_conservation(self):
+        allocate = NAMESPACE['allocate_fen']
+        for total in range(51):
+            for weights in [(1,), (1, 1, 1), (0, 2, 5), (3, 0, 2, 8)]:
+                result = allocate(total, weights)
+                self.assertEqual(sum(result), total)
+                self.assertTrue(all(value >= 0 for value in result))
+        self.assertEqual(allocate(100, (1, 1, 1)), (34, 33, 33))
+        for total, weights in [(-1, (1,)), (1, (0, 0)), (True, (1,)), (1, (True,))]:
+            with self.assertRaises(ValueError):
+                allocate(total, weights)
+
+    def test_utc_requires_offset(self):
+        with self.assertRaises(ValueError):
+            NAMESPACE['as_utc'](datetime(2024, 1, 1))
+        self.assertEqual(NAMESPACE['as_utc'](datetime(2024, 1, 1, tzinfo=timezone.utc)).hour, 0)
+
+    def test_dst_rejects_gap_and_overlap(self):
+        resolve = NAMESPACE['local_to_utc_strict']
+        zone = ZoneInfo('America/New_York')
+        for local in [datetime(2024, 3, 10, 2, 30), datetime(2024, 11, 3, 1, 30)]:
+            with self.assertRaises(ValueError):
+                resolve(local, zone)
+        self.assertEqual(resolve(datetime(2024, 6, 1, 12), zone).hour, 16)
+        spring = resolve(datetime(2024, 3, 11), zone) - resolve(datetime(2024, 3, 10), zone)
+        autumn = resolve(datetime(2024, 11, 4), zone) - resolve(datetime(2024, 11, 3), zone)
+        self.assertEqual(spring.total_seconds(), 23 * 3600)
+        self.assertEqual(autumn.total_seconds(), 25 * 3600)
+
+    def test_json_rejects_duplicates_nonfinite_and_overflow(self):
+        def parse(raw):
+            return json.loads(raw, parse_constant=JSON_NS['reject_constant'],
+                              parse_float=JSON_NS['finite_json_float'],
+                              object_pairs_hook=JSON_NS['unique_object'])
+        for raw in ['NaN', 'Infinity', '1e400', '-1e400', '{"id":1,"id":2}']:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse(raw)
+        self.assertEqual(parse('{"order_id":"9007199254740993"}')['order_id'], '9007199254740993')
+        self.assertEqual(parse('{"x":1.5}')['x'], 1.5)
+
+    def test_validation_shape_and_duplicates(self):
+        from pydantic import ValidationError
+        model = MODEL_NS['CreateOrder']
+        command = model.model_validate_json('{"lines":[{"sku_id":1,"quantity":2}]}')
+        self.assertIsInstance(command.lines, tuple)
+        invalid = [
+            {'lines': []},
+            {'lines': [{'sku_id': True, 'quantity': 2}]},
+            {'lines': [{'sku_id': 1, 'quantity': '2'}]},
+            {'lines': [{'sku_id': 1, 'quantity': 0}]},
+            {'lines': [{'sku_id': 1, 'quantity': 2}] * 2},
+            {'lines': [{'sku_id': 1, 'quantity': 2}], 'tenant_id': 9},
+        ]
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                model.model_validate(payload)
+
+
+class ContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_isolation_and_restore(self):
+        rid = CONTEXT_NS['request_id']
+        middleware_type = CONTEXT_NS['RequestContextMiddleware']
+        entered = 0
+        ready = asyncio.Event()
+        observed = []
+
+        async def app(scope, receive, send):
+            nonlocal entered
+            before = rid.get()
+            entered += 1
+            if entered == 2:
+                ready.set()
+            await ready.wait()
+            observed.append((before, rid.get()))
+
+        wrapped = middleware_type(app)
+        token = rid.set('outer')
+        try:
+            await asyncio.gather(*[
+                wrapped({'type': 'http', 'headers': [(b'x-request-id', value)]}, None, None)
+                for value in (b'alpha', b'beta')
+            ])
+            self.assertEqual(set(observed), {('alpha', 'alpha'), ('beta', 'beta')})
+            self.assertEqual(rid.get(), 'outer')
+        finally:
+            rid.reset(token)
+
+    async def test_failure_restore_and_invalid_id(self):
+        rid = CONTEXT_NS['request_id']
+        async def app(scope, receive, send):
+            self.assertRegex(rid.get(), r'^[0-9a-f]{32}$')
+            raise LookupError('expected')
+        wrapped = CONTEXT_NS['RequestContextMiddleware'](app)
+        with self.assertRaises(LookupError):
+            await wrapped({'type': 'http', 'headers': [(b'x-request-id', b'bad\nvalue')]}, None, None)
+        self.assertEqual(rid.get(), '')
+
+    async def test_thread_copy_context(self):
+        rid = CONTEXT_NS['request_id']
+        token = rid.set('thread-test')
+        try:
+            context = copy_context()
+            actual = await asyncio.get_running_loop().run_in_executor(None, context.run, rid.get)
+            self.assertEqual(actual, 'thread-test')
+        finally:
+            rid.reset(token)
+
+
+def suite():
+    loader = unittest.defaultTestLoader
+    result = loader.loadTestsFromModule(sys.modules[__name__])
+    spec = importlib.util.spec_from_file_location('skill_batch_tests', ROOT / 'tests/test_batch.py')
+    test_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(test_module)
+    result.addTests(loader.loadTestsFromModule(test_module))
+    return result
+
+
+if __name__ == '__main__':
+    outcome = unittest.TextTestRunner(verbosity=2).run(suite())
+    sys.exit(not outcome.wasSuccessful())

@@ -1,0 +1,4 @@
+interface:
+  display_name: "生产级代码工程"
+  short_description: "按项目技术栈编写、重构与审查生产级代码，覆盖并发、数据一致性与故障恢复"
+  default_prompt: "使用 $production-code，按当前项目的语言、框架和版本完成任务，落实相关质量约束并报告实际验证结果。"
