@@ -146,9 +146,10 @@ public Reservation reserve(Command command, Quote quote) throws ReservationRejec
 
 - 根据代理类型核实方法可见性、`final`、接口代理与 CGLIB 限制；不要靠同类 `this` 调用验证事务、缓存或权限切面。
 - 默认通常是 `RuntimeException` / `Error` 回滚；checked exception、Spring 6.2+ 可配置全局规则及项目自定义规则都要检查。显式按异常类型配置，避免宽泛字符串匹配。
-- 捕获异常后返回“失败结果”不会自动触发回滚；内层已 rollback-only 后继续外层提交可能出现 `UnexpectedRollbackException`。
+- 捕获异常后返回普通业务“失败结果”不会自动触发回滚；内层已 rollback-only 后继续外层提交可能出现 `UnexpectedRollbackException`。
+- Spring 6.1+ 对事务方法**返回当时已经完成**的 `Future` / `CompletableFuture` 有特殊检查，例如 `CompletableFuture.failedFuture(ex)` 可按回滚规则触发回滚；不能把这个特例推广到稍后才失败或取消的任务。命令式事务不会等待一个尚未完成的 Future 来决定提交，提交后的取消也不能撤回数据库写入；`@Async` 和 `@Transactional` 的实际代理链与线程归属要在目标版本验证。
 - 外部扣款不能靠本地事务原子化；使用业务幂等和 outbox/补偿方案。提交前不对外报告成功。
-依据：[Spring 代理与自调用](https://docs.spring.io/spring-framework/reference/6.2/core/aop/proxying.html)、[回滚语义](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html)。
+依据：[Spring 代理与自调用](https://docs.spring.io/spring-framework/reference/6.2/core/aop/proxying.html)、[回滚语义（6.2）](https://docs.spring.io/spring-framework/reference/6.2/data-access/transaction/declarative/rolling-back.html)。
 
 ## 6. MDC：提交时捕获，执行时安装，退出时恢复
 
@@ -224,13 +225,16 @@ return CompletableFuture.supplyAsync(() -> blockingClient.fetch())
 ```java
 CompletableFuture<HttpResponse<Void>> probe(
         HttpClient client, URI trustedUri, Duration budget) {
-    if (budget.toMillis() < 1) throw new IllegalArgumentException("expired budget");
+    long budgetNanos = budget.toNanos();  // 调用边界限制为可表示的有限时长。
+    if (budgetNanos <= 0) throw new IllegalArgumentException("expired budget");
+    long started = System.nanoTime();
     HttpRequest request = HttpRequest.newBuilder(trustedUri)
             .timeout(budget).GET().build();
     CompletableFuture<HttpResponse<Void>> operation = client.sendAsync(
             request, HttpResponse.BodyHandlers.discarding());
+    long remaining = budgetNanos - (System.nanoTime() - started);
     CompletableFuture<HttpResponse<Void>> result = operation.copy()
-            .orTimeout(budget.toMillis(), TimeUnit.MILLISECONDS);
+            .orTimeout(Math.max(0, remaining), TimeUnit.NANOSECONDS);
     result.whenComplete((response, error) -> {
         if (error != null) operation.cancel(true);
     });
@@ -241,6 +245,8 @@ CompletableFuture<HttpResponse<Void>> probe(
 - JDK 默认 HTTP 实现会尝试取消交换，不承诺即时释放，也不能撤回远端已执行的写入；此例使用只读 GET。
 - 一次请求发起多个下游时分别设置预算；总请求预算采用单调时钟剩余时长，不能每个阶段重新得到完整超时。
 - 组合方保留每个原始操作的取消句柄；任一必需分支失败、上游取消或后续提交被拒绝时，处理已启动的兄弟操作。
+- 本例取消返回的 `result` 会请求取消 `operation`。普通 `CompletableFuture` 的下游阶段取消不会自动向上游传播，`allOf` 也要等所有输入完成才结束，并不自动快速失败或取消兄弟任务；组合方应显式连接这些退出路径。取消可能被包装在 `CompletionException` / `ExecutionException` 中，恢复逻辑不能把它误当作可降级的普通故障。
+- 非 `async` 回调可能在完成 Future 的线程执行，超时回调还可能占用 JDK 的定时触发线程；这里仅发起非阻塞取消，不在 `whenComplete` 中执行阻塞清理或 RPC。
 - `CompletableFuture.cancel(true)` 本身不提供任意计算的线程中断保证。对受管阻塞任务可持有 `Future` 并请求中断，但任务及客户端必须协作；底层 socket/query 仍需有限超时。
 - 吞掉 `InterruptedException` 会破坏停机/取消；选择继续抛出，或包装为领域异常前先 `Thread.currentThread().interrupt()`。不要调用 `Thread.stop()`。
 依据：[CompletableFuture 取消语义](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/CompletableFuture.html)、[HttpClient 生命周期与取消](https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/java/net/http/HttpClient.html)。

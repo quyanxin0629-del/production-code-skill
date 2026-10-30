@@ -42,6 +42,7 @@ description: 编写、修复、重构或审查应用与库代码时，按仓库�
 | 维度五的 JUC 复合操作、分段锁、多锁顺序与快照发布 | [references/juc-locks.md](references/juc-locks.md) |
 | TypeScript / JavaScript、Go、Rust、C#、C / C++ 及其他语言 | [references/other-languages.md](references/other-languages.md) |
 | 维度六 / 七 / 八：MySQL、Redis、网络、MQ、滚动演进 | [references/data-and-resilience.md](references/data-and-resilience.md) |
+| 改动涉及外部 URL、文件 / 归档、进程调用、不可信反序列化或 HTML 输出 | [references/security-boundaries.md](references/security-boundaries.md) |
 | 测试选择、并发验证、性能证据与交付 | [references/verification.md](references/verification.md) |
 
 维度五的进程内并发模式在语言指南中；跨实例幂等、数据库原子性和流量治理在数据指南中。前端、CLI、嵌入式和纯计算库不需要无关的数据库 / 中间件规则。
@@ -54,6 +55,8 @@ description: 编写、修复、重构或审查应用与库代码时，按仓库�
 4. **一致性可论证。** 关键前置条件进入原子写入，检查行数、唯一键或版本冲突；明确生效点和提交时点。进程锁和缓存租约不能替代跨实例数据约束。
 5. **失败可恢复。** 取消继续传播，仅对已识别且允许恢复的错误重试或降级。多次尝试共享总时间和重试预算；未知提交结果依靠幂等协议查询或重放。
 6. **演进兼容。** 混合版本运行时考虑旧读新写、新读旧写、回填与回滚窗口。不为小任务预先引入无关框架、缓存、队列或插件系统。
+
+涉及数据库读取时，先限定需要的列、行范围和页大小，再按相关 ID 批量加载必要关联或选择经计划验证的 JOIN；避免全量物化和逐条 N+1。单对象点查不预取未来可能需要的全库数据；全量导出采用有界分批或流式，并定义一致性语义。
 
 ## 避免错误铁律
 

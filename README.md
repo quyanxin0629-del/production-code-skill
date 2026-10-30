@@ -61,6 +61,8 @@ Skill 也可根据任务自动匹配。Codex 通常会自动发现变更，未�
 - **其他语言适配**：[TypeScript / JavaScript、React、Go、Rust / Tokio、C# / .NET、C / C++](production-code/references/other-languages.md)。覆盖执行模型与关键失误模式，不宣称与 Python / Java 同等深度。
 - **未知语言与场景**：先识别版本、运行时、所有权、错误模型和资源边界，再映射工程不变量。前端、CLI、嵌入式不会被强行套上数据库与微服务架构。
 
+涉及外部 URL、上传 / 归档、进程执行、反序列化或 HTML 输出时，按需读取 [安全边界](production-code/references/security-boundaries.md)。数据库读取默认按需投影与限页，关联批量加载；比较扫描行、返回字节、往返与一致性，不以查询次数单独判断优劣。
+
 ## 它怎样工作
 
 先确认项目事实，再读取相关参考，按任务在五种模式中执行：**实现 / 修复、重构、只读审查、方案设计、讲解**。核心入口保持精简，详细模式按需加载。
@@ -86,11 +88,17 @@ python3 -m venv .venv
 .venv/bin/python scripts/validate.py
 ```
 
+Java 标准库机制验证需要 JDK 17+，无需 Maven 或外部服务：
+
+```sh
+python3 scripts/validate_java.py
+```
+
 Windows 可使用 `.venv\Scripts\python` 执行后两步。
 
-验证器检查元数据、本地链接、代码围栏和 Python AST，并直接提取发布参考中的代码运行金额、时间、JSON、上下文隔离和有界批处理用例。初次本地验证 **22 项通过，75 段 Python AST 解析通过**；详见 [范围与限制](docs/validation.md)。
+验证器检查元数据、引用可达性、代码围栏和 Python AST，自动发现 tests 下的新增回归用例，直接提取参考中的代码运行。测试覆盖金额、时间、JSON、上下文、资源退出、有界批处理、指标故障、缓存边界、重试、消费幂等和安全端口；Lua 通过 Lupa 2.6 的 Lua 5.1 与 Redis 命令替身执行。另从 Java 参考提取锁、快照与 Future 示例编译运行。最新结果见 [验证报告](docs/validation.md)。
 
-仓库提供 GitHub Actions 验证配置。Python / Java 指南中的业务端口、实体和外部 SDK 仍需接入实际项目；本仓库验证不等同于所有语言编译、目标中间件集成或生产压测。
+GitHub Actions 配置覆盖 Linux / Windows 上的 Python 3.11 / 3.12，以及 Linux 上的 JDK 17 / 21。业务端口、实体和 SDK 仍需接入项目；机制测试不等同于 Spring、真实 HTTP、MySQL、Redis 或 Kafka 集成及生产压测。
 
 ## 项目结构
 
@@ -98,6 +106,7 @@ Windows 可使用 `.venv\Scripts\python` 执行后两步。
 production-code/       可安装的 Skill，含 SKILL.md、agents 和 references
 docs/                  使用说明与验证范围
 scripts/validate.py    可复现校验入口
+scripts/validate_java.py  Java 参考编译与机制验证
 tests/                 批处理边界与取消测试
 .github/workflows/     CI 验证
 ```

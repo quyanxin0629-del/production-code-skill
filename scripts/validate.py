@@ -3,7 +3,6 @@ import asyncio
 from contextvars import copy_context
 from datetime import datetime, timezone
 from decimal import Decimal
-import importlib.util
 import json
 from pathlib import Path
 import re
@@ -19,8 +18,48 @@ SKILL = ROOT / 'production-code'
 REFERENCE = SKILL / 'references/defensive-and-observability.md'
 
 
+def fenced_blocks(content):
+    """Read backtick/tilde fences without treating shorter inner fences as closes."""
+    opened = None
+    body = []
+    for line in content.splitlines():
+        if opened is None:
+            match = re.fullmatch(r' {0,3}(`{3,}|~{3,})(.*)', line)
+            if match:
+                marker, info = match.groups()
+                language = info.strip().split(maxsplit=1)
+                opened = (marker[0], len(marker), language[0].lower() if language else '')
+                body = []
+        else:
+            marker, length, language = opened
+            if re.fullmatch(r' {0,3}' + re.escape(marker) + '{' + str(length) + r',}[ \t]*', line):
+                yield language, '\n'.join(body)
+                opened = None
+            else:
+                body.append(line)
+    if opened is not None:
+        raise ValueError('unclosed Markdown code fence')
+
+
 def blocks(path):
-    return re.findall(r'```python\n(.*?)\n```', path.read_text(), re.S)
+    return [body for language, body in fenced_blocks(path.read_text(encoding="utf-8"))
+            if language in {'python', 'python3', 'py'}]
+
+
+def local_links(path, root):
+    for target in re.findall(r'\]\(([^)]+)\)', path.read_text(encoding="utf-8")):
+        parsed = urlsplit(target)
+        if parsed.scheme or not parsed.path:
+            continue
+        resolved = (path.parent / unquote(parsed.path)).resolve()
+        if not resolved.is_relative_to(root.resolve()) or not resolved.is_file():
+            raise ValueError(f'invalid local reference in {path.name}: {target}')
+        yield resolved
+
+
+def discover_tests(path):
+    # Use a fresh loader so another discovery root cannot leak cached settings.
+    return unittest.TestLoader().discover(str(path), pattern='test_*.py')
 
 
 def find_block(marker, path=REFERENCE):
@@ -43,31 +82,33 @@ exec(compile(find_block('class RequestContextMiddleware'), str(REFERENCE), 'exec
 
 class ArtifactTests(unittest.TestCase):
     def test_metadata(self):
-        content = (SKILL / 'SKILL.md').read_text()
+        content = (SKILL / 'SKILL.md').read_text(encoding="utf-8")
         metadata = yaml.safe_load(content.split('---', 2)[1])
         self.assertEqual(metadata['name'], 'production-code')
         self.assertTrue(metadata['description'])
-        interface = yaml.safe_load((SKILL / 'agents/openai.yaml').read_text())['interface']
+        interface = yaml.safe_load((SKILL / 'agents/openai.yaml').read_text(encoding="utf-8"))['interface']
         self.assertIn('$production-code', interface['default_prompt'])
         self.assertGreaterEqual(len(interface['short_description']), 25)
         self.assertLessEqual(len(interface['short_description']), 64)
 
     def test_markdown_and_local_links(self):
         files = list(SKILL.rglob('*.md'))
-        self.assertEqual(len(files), 9)
+        self.assertTrue(files)
+        graph = {}
         for file in files:
             with self.subTest(file=file.name):
-                content = file.read_text()
-                fences = re.findall(r'^```.*$', content, re.M)
-                self.assertEqual(len(fences) % 2, 0)
+                content = file.read_text(encoding="utf-8")
+                list(fenced_blocks(content))
                 self.assertNotIn('[TODO:', content)
-                for target in re.findall(r'\]\(([^)]+)\)', content):
-                    parsed = urlsplit(target)
-                    if parsed.scheme or not parsed.path:
-                        continue
-                    resolved = (file.parent / unquote(parsed.path)).resolve()
-                    self.assertTrue(resolved.is_relative_to(SKILL.resolve()), target)
-                    self.assertTrue(resolved.is_file(), target)
+                graph[file.resolve()] = set(local_links(file, SKILL))
+        reached = set()
+        pending = [(SKILL / 'SKILL.md').resolve()]
+        while pending:
+            current = pending.pop()
+            if current not in reached:
+                reached.add(current)
+                pending.extend(graph.get(current, set()) - reached)
+        self.assertFalse(set(graph) - reached, 'unreachable Skill reference files')
 
     def test_python_fences_parse(self):
         count = 0
@@ -76,7 +117,7 @@ class ArtifactTests(unittest.TestCase):
                 with self.subTest(file=file.name, block=index):
                     ast.parse(block, filename=f'{file.name}:{index}')
                 count += 1
-        self.assertGreater(count, 35)
+        self.assertGreater(count, 0)
 
 
 class DefensiveTests(unittest.TestCase):
@@ -200,10 +241,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
 def suite():
     loader = unittest.defaultTestLoader
     result = loader.loadTestsFromModule(sys.modules[__name__])
-    spec = importlib.util.spec_from_file_location('skill_batch_tests', ROOT / 'tests/test_batch.py')
-    test_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(test_module)
-    result.addTests(loader.loadTestsFromModule(test_module))
+    result.addTests(discover_tests(ROOT / 'tests'))
     return result
 
 

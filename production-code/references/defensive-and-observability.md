@@ -83,13 +83,18 @@ Bad：每人独立四舍五入，三份 0.33 不能覆盖 1.00。
 shares = [round(total / 3, 2)] * 3
 ```
 
-Good：最小单位整数 + 最大余数法；相同余数按稳定业务顺序打破平局。本例 total 和 weights 已有大小上限，允许非负整数。
+Good：最小单位整数 + 最大余数法；相同余数按稳定业务顺序打破平局。示例限制总额、单个权重和明细数，实际范围由业务确认。
 
 ```python
+MAX_TOTAL_FEN = 10**14 - 1  # 对应 D1 的金额范围
+MAX_WEIGHT = 10**9
+MAX_PARTS = 10_000
+
 def allocate_fen(total_fen: int, weights: tuple[int, ...]) -> tuple[int, ...]:
-    if type(total_fen) is not int or total_fen < 0 or not weights:
+    if (type(total_fen) is not int or not 0 <= total_fen <= MAX_TOTAL_FEN
+            or type(weights) is not tuple or not 1 <= len(weights) <= MAX_PARTS):
         raise ValueError("invalid allocation")
-    if any(type(w) is not int or w < 0 for w in weights):
+    if any(type(w) is not int or not 0 <= w <= MAX_WEIGHT for w in weights):
         raise ValueError("invalid weight")
     denominator = sum(weights)
     if denominator == 0:
@@ -139,7 +144,10 @@ from datetime import datetime, timezone
 def as_utc(instant: datetime) -> datetime:
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise ValueError("timezone required")
-    return instant.astimezone(timezone.utc)
+    try:
+        return instant.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise ValueError("UTC instant outside supported datetime range") from exc
 
 paid_at = datetime.now(timezone.utc)
 ```
@@ -176,8 +184,11 @@ def local_to_utc_strict(local: datetime, zone: ZoneInfo) -> datetime:
     candidates = set()
     for fold in (0, 1):
         attached = local.replace(tzinfo=zone, fold=fold)
-        utc = attached.astimezone(timezone.utc)
-        restored = utc.astimezone(zone).replace(tzinfo=None)
+        try:
+            utc = attached.astimezone(timezone.utc)
+            restored = utc.astimezone(zone).replace(tzinfo=None)
+        except OverflowError as exc:
+            raise ValueError("local time outside supported datetime range") from exc
         if restored == local:
             candidates.add(utc)
     if len(candidates) != 1:
@@ -195,7 +206,7 @@ static Instant resolveStrict(LocalDateTime local, ZoneId zone) {
 }
 ```
 
-查询营业日使用半开区间 `[该日当地起点, 下一日当地起点)`，分别转换成 UTC。不要以起点加 86400 秒代替下一日；日历跨度和真实经过时长可能不同。涉及当地零点不存在 / 重叠的地区也需定义策略。月底加月明确“夹到月底”或拒绝，不能用固定 30 天替代。
+查询营业日使用半开区间 `[该日当地起点, 下一日当地起点)`，分别转换成 UTC。不要以起点加 86400 秒代替下一日；日历跨度和真实经过时长可能不同。涉及当地零点不存在 / 重叠的地区也需定义策略。月底加月明确“夹到月底”或拒绝，不能用固定 30 天替代。边界年份还要检查 UTC 转换和“下一日/加月”是否越过运行时或数据库的可表示范围；拒绝越界，不截断成最大日期。
 
 Bad / Good：耗时测量使用单调时钟，避免系统校时导致负数。
 

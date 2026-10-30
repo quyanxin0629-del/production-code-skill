@@ -184,6 +184,7 @@ def timed(fn):
 ```
 Good：等待实际执行，finally 记录；emit 为应用注入的有界非 IO 事件入口。
 ```python
+import asyncio
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from time import perf_counter_ns
@@ -191,23 +192,43 @@ from typing import ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 
+_EMIT_FAILURE_LIMIT = (1 << 63) - 1
+_timing_emit_failures = 0
+
+def timing_diagnostics() -> dict[str, int]:
+    """Read this snapshot on the same event loop as the timed wrappers."""
+    return {"emit_failures": _timing_emit_failures}
+
 def timed(emit):
     def decorate(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         label = f"{fn.__module__}.{fn.__qualname__}"
         @wraps(fn)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            global _timing_emit_failures
             start = perf_counter_ns()
-            outcome = "aborted"
+            outcome = "error"
             try:
                 value = await fn(*args, **kwargs)
                 outcome = "ok"
                 return value
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
             finally:
-                emit(label, outcome, perf_counter_ns() - start)
+                try:
+                    emit(label, outcome, perf_counter_ns() - start)
+                except Exception:
+                    # Observability failure must not replace the business
+                    # return value, exception, or cancellation.
+                    _timing_emit_failures = min(
+                        _timing_emit_failures + 1, _EMIT_FAILURE_LIMIT
+                    )
         return wrapper
     return decorate
 ```
-emit 契约：固定小字段、有界 queue.put_nowait、满时计数并丢弃观测事件，不抛可预期的满队列异常；消费者受监督并上报丢弃量。若区分取消与普通错误，在重新抛出前设置有限 outcome；不得吞掉业务异常。wraps 维护反射元信息，ParamSpec 维护静态参数类型，两者不能互相替代；跨模块延迟注解和 FastAPI DI 仍需验证。
+emit 契约：同步、非阻塞，固定小字段、有界 queue.put_nowait、满时计数并丢弃观测事件，不抛可预期的满队列异常；消费者受监督并上报丢弃量。装饰器另外隔离普通观测异常，保留原返回值、业务异常和取消，并递增固定大小的进程内饱和计数；应用健康检查须读取 `timing_diagnostics()` 的失败计数并告警，不能把持续观测故障当成正常。包装器与诊断读取限定于同一事件循环；多线程、多事件循环须另设同步与聚合。该计数不保留异常对象，不发起可能继续失败的日志 IO，也不替代 emit 的满队列丢弃量。
+
+这是受控观测端口的隔离边界，不是吞掉业务异常的通用模板。这里不捕获 KeyboardInterrupt/SystemExit 等 BaseException 控制信号，emit 也不得用 CancelledError 表示指标失败。wraps 维护反射元信息，ParamSpec 维护静态参数类型，两者不能互相替代；跨模块延迟注解和 FastAPI DI 仍需验证。
 
 来源：[wraps](https://docs.python.org/3.11/library/functools.html#functools.wraps)、[ParamSpec](https://docs.python.org/3.11/library/typing.html#typing.ParamSpec)。
 
@@ -228,10 +249,16 @@ from functools import lru_cache
 request_id = ContextVar("request_id", default="")
 
 @lru_cache(maxsize=128)
-def parse_columns(columns: tuple[str, ...]) -> tuple[str, ...]:
-    if len(columns) > 64:
-        raise ValueError("too many columns")
+def _parse_columns(columns: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(name.strip() for name in columns)
+
+def parse_columns(columns: tuple[str, ...]) -> tuple[str, ...]:
+    # Example protocol bounds: validate before LRU hashes/retains the key.
+    if not isinstance(columns, tuple) or len(columns) > 64:
+        raise ValueError("expected at most 64 column names in a tuple")
+    if any(not isinstance(name, str) or len(name) > 128 for name in columns):
+        raise ValueError("column names must be strings of at most 128 characters")
+    return _parse_columns(columns)
 
 async def dispatch(rid, handler):
     token = request_id.set(rid)
@@ -240,7 +267,7 @@ async def dispatch(rid, handler):
     finally:
         request_id.reset(token)
 ```
-缓存键/结果的单项大小也要在边界限制，条目数上限不等于字节上限。LRU 无 TTL，线程安全也不等于同键只计算一次；异步 IO 缓存需要任务共享、取消、TTL、租户/权限/版本键策略，不能用这个片段替代。ContextVar 是上下文隔离，不是权限来源；Task 创建会复制上下文，新后台任务可能持有过时身份；线程传播按实际 API 核实，to_thread 和任意线程池不能混为一谈。
+缓存键/结果的单项大小也要在边界限制，条目数上限不等于字节上限。这里的 64 列、128 字符是示例协议限制，实际按业务契约设置；校验在缓存包装器外，不能先用巨大键做 LRU 哈希。请求体本身还需在解析/构造这些对象前受限，内部缓存函数不对不可信输入开放。LRU 无 TTL，线程安全也不等于同键只计算一次；异步 IO 缓存需要任务共享、取消、TTL、租户/权限/版本键策略，不能用这个片段替代。ContextVar 是上下文隔离，不是权限来源；Task 创建会复制上下文，新后台任务可能持有过时身份；线程传播按实际 API 核实，to_thread 和任意线程池不能混为一谈。
 
 来源：[lru_cache 限制](https://docs.python.org/3.11/library/functools.html#functools.lru_cache)、[contextvars](https://docs.python.org/3.11/library/contextvars.html)。
 

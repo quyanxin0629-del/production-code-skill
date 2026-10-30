@@ -56,10 +56,12 @@ final class LocalStripes {
 
 业务 key 使用稳定、已规范化的标识，必要时包含业务域和租户。相同 key 必须命中同一实例的同一 stripe；不同 key 碰撞只增加竞争，不破坏互斥。锁数量和公平性依据争用测量选择，不把 256 当成固定最佳值。
 
+分段锁也要求底层容器能承受不同 stripe 并行访问：不能用不同 key 的锁并发向同一个普通 `HashMap` 插入/删除。可选 `ConcurrentHashMap`，或每个 stripe 自有、仅在对应锁内访问的普通 Map。容器线程安全仍不等于业务复合操作原子化；同键的所有读写、删除、替换必须遵守同一个锁协议。
+
 `update` 只做该锁保护的短小本地状态更新，不调用未知代码、不取得额外 stripe、不把 HTTP/文件/数据库 IO 包进去。可移出锁的计算先得到输入快照，持锁时验证版本再更新，避免使用已经过期的计算结果。
 
 在多个 JVM、多个服务实例之间，本地锁完全不能建立互斥。即使 JVM 内加锁，数据库写入仍可能需要 CAS/唯一约束。未取得锁时不能 unlock；`InterruptedException` 向上传播，或恢复中断标记后转为明确失败。
-依据：[ReentrantLock 与 timed tryLock](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/concurrent/locks/ReentrantLock.html)。
+依据：[ReentrantLock 与 timed tryLock](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/concurrent/locks/ReentrantLock.html)、[HashMap 的外部同步要求](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/HashMap.html)。
 
 ## 3. 多键操作：按去重后的 stripe 排序，并共享总等待预算
 
@@ -104,6 +106,38 @@ void withKeys(Collection<String> keys, Duration budget, Runnable update)
 
 若 `update` 里再任意取得锁，整个证明失效。多数据库锁也应检查实际访问顺序与执行计划，JVM 的 stripe 顺序不会自动约束数据库锁顺序。
 
+### 锁不提供异常回滚：先算出完整新状态，再修改
+
+**Bad**：即便同时持有两把锁，第二步溢出仍会留下已经扣减的余额。
+
+```java
+balances.put(from, balances.get(from) - amount);
+balances.put(to, Math.addExact(balances.get(to), amount));
+```
+
+**Good**：以下为进程内、预先初始化且不增删账户的余额模型；所有写入和需要一致结果的读取都由同一个 `stripes` 保护。余额用非负 `long` 最小单位，转入转出必须不同；这个例子维护非负和转账总额守恒，不承担数据库持久性。
+
+```java
+// 共享字段：private final ConcurrentHashMap<String, Long> balances;
+// 共享字段：private final LocalStripes stripes;
+void transfer(String from, String to, long amount, Duration budget)
+        throws InterruptedException, TimeoutException {
+    if (amount <= 0 || from.equals(to)) throw new IllegalArgumentException("invalid transfer");
+    stripes.withKeys(List.of(from, to), budget, () -> {
+        Long debit = balances.get(from);
+        Long credit = balances.get(to);
+        if (debit == null || credit == null) throw new IllegalArgumentException("unknown account");
+        if (debit < amount) throw new IllegalStateException("insufficient balance");
+        long nextDebit = Math.subtractExact(debit, amount);
+        long nextCredit = Math.addExact(credit, amount);
+        balances.put(from, nextDebit);
+        balances.put(to, nextCredit);
+    });
+}
+```
+
+普通业务失败和算术溢出在首次写入前发现，`finally` 只负责解锁，不会恢复已经修改的数据。读取两账户合计也必须一次取得这两个 key 的锁；直接分别 `get` 或遍历 ConcurrentHashMap 可能看见转账中间状态。需要全表一致快照时，使用覆盖全体相关 stripe 的统一协议或下一节的不可变快照；不能把弱一致遍历当成业务快照。进程崩溃或 VM 级故障仍不具有事务回滚保证。
+
 ## 4. 读多写少：发布一致的不可变快照，或选择经验证的锁协议
 
 **Bad**：原子引用里的对象仍然可变，读取多个字段时可能观察到不一致版本。
@@ -142,6 +176,6 @@ AtomicReference 的 get/set 使用对应 volatile 内存语义，CAS/原子更�
 
 ## 验证重点
 
-用 latch/barrier 驱动同键竞争、反向多键竞争、stripe 碰撞、锁获取一半时中断/超时、更新异常后的解锁；验证最终不变量与后续请求仍可取得锁。快照测试验证并发写入不丢更新、读者看见的是同一版本的完整状态。压力测试不能证明算法必然正确，计数正确也不代表跨进程一致性已经建立。
+用 latch/barrier 驱动同键竞争、反向多键竞争、stripe 碰撞、锁获取一半时中断/超时、更新异常后的解锁；验证最终不变量与后续请求仍可取得锁。转账另外覆盖余额不足、目标溢出后原状态不变，以及持相同多键锁读取时总额守恒。快照测试验证并发写入不丢更新、读者看见的是同一版本的完整状态。压力测试不能证明算法必然正确，计数正确也不代表跨进程一致性已经建立。
 
 来源核对：2026-10-30；这些是针对指定 Java API 的机制约束，不承诺无锁算法、固定吞吐提升或零争用。

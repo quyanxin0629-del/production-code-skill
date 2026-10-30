@@ -15,6 +15,7 @@
 | references/data-and-resilience.md | 维度六 / 七 / 八：MySQL、Redis、外部调用、MQ、兼容迁移 |
 | references/other-languages.md | TS/JS、React、Go、Rust、C#、C/C++ 和未知语言适配 |
 | references/verification.md | 风险相称的测试、并发 / 故障验证、性能证据 |
+| references/security-boundaries.md | 外部 URL、文件 / 归档、进程调用、HTML 与不可信反序列化 |
 | agents/openai.yaml | Codex 界面元数据，保持默认自动匹配能力 |
 
 Python 和 Java 提供深度参考；其他语言提供执行模型、关键风险和正反例，并要求按项目版本核对 API。它不声称穷尽所有语言和业务。

@@ -67,9 +67,20 @@ WHERE tenant_id = :tenant AND sku_id = :sku
 
 ## 3. N+1：查询次数必须随业务批次有界
 
-**Bad：序列化或模板访问关系时，隐式触发逐条查询。**
+在线读取默认在数据库中按权限、条件和页大小缩小结果，只取所需字段。选择依据是本次需要的数据范围，不能只为减少 SQL 次数把整表装进内存。
+
+| 读取场景 | 默认做法与边界 |
+|---|---|
+| 只需一个实体的部分字段 | 按完整业务键/租户点查并投影字段；不顺带加载无关集合 |
+| 一页父记录及其必要明细 | 先限页父结果，再以这一页 ID 做有界 `IN` 批取；明细有业务数量/字节上限，超出则独立游标分页 |
+| 少量必要的关联字段 | 可 JOIN 单值关系或有明确基数的关系；检查索引、重复父行和分页语义 |
+| 真正很小且有上限的完整集合 | 可一次取齐，例如受控配置表；仍验证行数、字节及更新频率 |
+| 全量导出、离线计算 | 用驱动流式读取或稳定键分批推进；定义快照/版本边界，逐批处理并释放内存 |
+
+**Bad：为了少查一次先装整表；或序列化/模板隐式触发逐条查询。**
 
 ```python
+all_orders = (await session.scalars(select(Order))).all()  # 任意大整表进入内存
 orders = (await session.scalars(select(Order).limit(100))).all()
 return [serialize(order, order.items) for order in orders]
 ```
@@ -77,21 +88,28 @@ return [serialize(order, order.items) for order in orders]
 **Good：在查询边界声明所需关系，限制父结果并禁止未计划的懒加载。**
 
 ```python
-from sqlalchemy.orm import raiseload, selectinload
+from sqlalchemy.orm import load_only, raiseload, selectinload
 
 stmt = (
     select(Order).where(Order.tenant_id == tenant_id).order_by(Order.id).limit(100)
-    .options(selectinload(Order.items), raiseload("*"))
+    .options(
+        load_only(Order.id, Order.created_at, Order.amount_cny_fen, raiseload=True),
+        selectinload(Order.items),
+        raiseload("*"),
+    )
 )
 orders = (await session.scalars(stmt)).all()
+# DTO 只读取上述字段及所需关系；明细也按需要投影，避免携带大型正文列。
+# 此写法还要求单个订单的 items 有已验证的数量/字节上限；否则明细单独分页。
 ```
 
 - `selectinload` 可能按参数和驱动限制分批，不能承诺任何数据规模永远只有两条 SQL。
+- 例如取 20 个订单和必要明细，常用一次父查询加一次 `IN` 明细查询；驱动参数上限和子集合预算可能要求继续分批。查询次数、返回行/字节、rows examined、内存及一致性快照语义一起衡量。
 - MyBatis 可先查一页订单，再按这一页 ID 分批查明细并分组；不要用循环 `selectById` 修补关联。
 - JOIN 多个集合可能产生笛卡尔膨胀；一条 SQL 不代表低成本。分页应先确定父集合，再加载明细。
 - 使用查询计数或集成测试验证对象到 DTO 的全过程；不要只观察入口执行的那一条 SQL。
 
-来源：[SQLAlchemy：Relationship Loading Techniques](https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html)。
+来源：[SQLAlchemy：Relationship Loading Techniques](https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html)、[列投影与 raiseload](https://docs.sqlalchemy.org/en/20/orm/queryguide/columns.html)。
 
 ## 4. 游标分页：全序、过滤条件与索引必须一致
 
@@ -230,20 +248,35 @@ if stock >= quantity:
 **Good：把有限的检查与修改放在一个脚本；返回约定码。**
 
 ```lua
-local quantity = tonumber(ARGV[1])
-local stock = tonumber(redis.call('GET', KEYS[1]))
-if not quantity or quantity < 1 or quantity % 1 ~= 0 then return -2 end
-if not stock or stock < quantity then return -1 end
-return redis.call('DECRBY', KEYS[1], quantity)
+-- 规范十进制整数限制在 Lua double 可精确表示的范围；先验证再读写。
+local function safe_uint(raw)
+    if type(raw) ~= 'string' or #raw > 16 then return nil end
+    if raw ~= '0' and not raw:match('^[1-9][0-9]*$') then return nil end
+    local value = tonumber(raw)
+    if not value or value > 9007199254740991 then return nil end
+    return value
+end
+if #KEYS ~= 1 or #ARGV ~= 1 then return -2 end
+local quantity = safe_uint(ARGV[1])
+if not quantity or quantity < 1 then return -2 end
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind == 'none' then return -1 end
+if kind ~= 'string' then return -3 end
+local stock = safe_uint(redis.call('GET', KEYS[1]))
+if not stock then return -3 end
+if stock < quantity then return -1 end
+-- 保留原整数文本，避免把大 Lua number 转成指数形式传给整数命令。
+return redis.call('DECRBY', KEYS[1], ARGV[1])
 ```
 
+- 返回非负剩余库存；`-1` 为缺失/不足，`-2` 为非法参数，`-3` 为错误键类型或库存编码。三种拒绝均不写数据；示例刻意不支持负数、前导零、指数、小数或超过 `2^53-1` 的整数。
 - 此脚本只保证一次 Redis 执行不被其他命令穿插；请求超时后重放仍会再次扣减，需独立幂等键和结果记录。
 - Lua 中预先验证参数、键类型及数值范围，限制在可安全精确计算范围；脚本运行错误不提供数据库式自动回滚。
 - Lua 执行期间阻塞其他活动，禁止大循环/无界集合遍历；Cluster 脚本键须满足同槽约束。
 - 批量独立 GET/SET 用有界 pipeline 减少 RTT；逐项检查响应，限制命令和响应字节；Cluster 可能分拆到多连接，不能声称永远一次 RTT。
 - redis-py 的 pipeline 是否默认事务化要按客户端确认；需要非事务批处理时显式 `transaction=False`，不要把 pipeline、MULTI/EXEC 与脚本混为一谈。
 
-来源：[Redis Pipelining](https://redis.io/docs/latest/develop/using-commands/pipelining/)、[Lua 执行语义](https://redis.io/docs/latest/develop/programmability/eval-intro/)。
+来源：[Redis Pipelining](https://redis.io/docs/latest/develop/using-commands/pipelining/)、[Lua 执行语义](https://redis.io/docs/latest/develop/programmability/eval-intro/)、[Lua API 与类型转换](https://redis.io/docs/latest/develop/programmability/lua-api/)。
 
 ## 9. 分布式锁：所有者解锁和资源侧 fencing 分别解决不同竞态
 
@@ -298,21 +331,44 @@ while True:
 **Good：仅对可安全重放的读操作采用有界重试；底层适配器负责分类异常。**
 
 ```python
+import asyncio
+import math
+import random
+
+def finite_seconds(value, name, *, nonnegative=False):
+    requirement = "finite nonnegative number" if nonnegative else "finite number"
+    if type(value) not in (int, float):
+        raise ValueError(f"{name} must be a {requirement}")
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} is outside the float range") from exc
+    if not math.isfinite(seconds) or (nonnegative and seconds < 0):
+        raise ValueError(f"{name} must be a {requirement}")
+    return seconds
+
 async def read_with_budget(operation, *, deadline, gate, max_attempts=3):
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be positive")
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    deadline = finite_seconds(deadline, "deadline")
+    loop = asyncio.get_running_loop()
     async with asyncio.timeout_at(deadline):  # deadline 使用当前 loop.time() 时钟域
         for attempt in range(max_attempts):
+            if loop.time() >= deadline:
+                raise TimeoutError("read budget exhausted")
             try:
                 async with gate:  # 有界等待；服务入口另有队列/任务容量限制
+                    if loop.time() >= deadline:
+                        raise TimeoutError("read budget exhausted")
                     return await operation()
             except TransientReadFailure as exc:
                 if attempt + 1 == max_attempts:
                     raise
-                ceiling = min(0.05 * (2 ** attempt), 0.5)
+                ceiling = min(0.05 * (2 ** min(attempt, 4)), 0.5)
                 delay = random.uniform(0, ceiling)
                 if exc.retry_after_s is not None:
-                    delay = max(delay, exc.retry_after_s)
+                    delay = max(delay, finite_seconds(
+                        exc.retry_after_s, "retry_after_s", nonnegative=True))
                 await asyncio.sleep(delay)
 ```
 
@@ -344,19 +400,29 @@ async with session_factory.begin() as session:
     await outbox.insert(session, event.id, event.type, event.payload)
 # relay：有限批次 claim -> 发送并等待确认 -> 标记已发；崩溃可重复发送。
 
+class InboxAlreadyProcessed(Exception):
+    pass
+
 async def consume(message):
     try:
         async with session_factory.begin() as session:
-            await inbox.insert(session, consumer_name, message.event_id)
+            try:
+                # 必须在此执行 INSERT/flush；不能推迟到业务操作或提交时才报唯一冲突。
+                await inbox.insert_and_flush(session, consumer_name, message.event_id)
+            except IntegrityError as exc:
+                if not is_exact_inbox_duplicate(exc):
+                    raise
+                raise InboxAlreadyProcessed() from exc
             await apply_local_effect(session, message)
-    except IntegrityError as exc:
-        if not is_exact_inbox_duplicate(exc):
-            raise
+    except InboxAlreadyProcessed:
+        pass  # 已退出事务并完成回滚；既有记录证明此前本地效果已提交。
     await broker.ack(message)
 ```
 
-- inbox 有 `UNIQUE(consumer_name, event_id)`；`is_exact_inbox_duplicate` 只接受该约束冲突，不能吞掉其他完整性错误。inbox 与业务效果必须同存储事务。
+- inbox 有 `UNIQUE(consumer_name, event_id)`；`is_exact_inbox_duplicate` 只接受该次 INSERT 的该约束冲突，不能把业务执行/提交阶段的完整性错误当成重复。inbox 与业务效果必须同存储事务，失败一起回滚；保留去重记录至少覆盖消息重放窗口。
+- 同一消费域中 event_id 稳定并绑定同一业务载荷；重复 ID 携带不同租户/载荷要隔离，不可当作成功重放。ack 失败会再次投递，提交结果未知时也依赖 inbox 重放判定，不能先补 ack。
 - outbox 标记和 broker 确认之间仍可能崩溃，所以消费者支持重复；事件 ID 应稳定，载荷有 schema_version、实体 ID、必要的实体序号。
+- relay 用短事务原子 claim 有限批次并记录租约/所有者；发送不占用 DB 事务。过期 claim 可重领，发送确认后按当前所有者条件标记已发，重试保持原 event_id；不能先标记已发再发送。
 - 外部邮件/支付等副作用不能加入本地 inbox 事务；使用下游幂等键或再次持久化意图并恢复，不能声称 inbox 解决全部 exactly-once。
 - 根据可靠性要求设置发送确认、Kafka acks/副本最小同步数及 producer 幂等配置；核对实际版本默认值。Kafka 事务的保证不自动覆盖外部 MySQL。
 - 消费提交在持久化效果之后；有界重试，区分暂态与毒丸。DLQ 持久化并获确认后才能推进原进度，告警并支持受控重放。

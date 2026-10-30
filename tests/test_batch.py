@@ -6,7 +6,7 @@ import re
 
 # Execute the exact bounded-batch example included in the distributed Skill.
 _reference = Path(__file__).resolve().parents[1] / 'production-code/references/python.md'
-_blocks = re.findall(r'```python\n(.*?)\n```', _reference.read_text(), re.S)
+_blocks = re.findall(r'```python\n(.*?)\n```', _reference.read_text(encoding="utf-8"), re.S)
 _matches = [block for block in _blocks if 'async def run_jobs' in block]
 if len(_matches) != 1:
     raise AssertionError('expected one bounded-batch example')
