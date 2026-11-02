@@ -12,33 +12,11 @@ from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 import yaml
+from example_blocks import fenced_blocks, load_example, parse_blocks
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'production-code'
 REFERENCE = SKILL / 'references/defensive-and-observability.md'
-
-
-def fenced_blocks(content):
-    """Read backtick/tilde fences without treating shorter inner fences as closes."""
-    opened = None
-    body = []
-    for line in content.splitlines():
-        if opened is None:
-            match = re.fullmatch(r' {0,3}(`{3,}|~{3,})(.*)', line)
-            if match:
-                marker, info = match.groups()
-                language = info.strip().split(maxsplit=1)
-                opened = (marker[0], len(marker), language[0].lower() if language else '')
-                body = []
-        else:
-            marker, length, language = opened
-            if re.fullmatch(r' {0,3}' + re.escape(marker) + '{' + str(length) + r',}[ \t]*', line):
-                yield language, '\n'.join(body)
-                opened = None
-            else:
-                body.append(line)
-    if opened is not None:
-        raise ValueError('unclosed Markdown code fence')
 
 
 def blocks(path):
@@ -62,22 +40,19 @@ def discover_tests(path):
     return unittest.TestLoader().discover(str(path), pattern='test_*.py')
 
 
-def find_block(marker, path=REFERENCE):
-    matches = [block for block in blocks(path) if marker in block]
-    if len(matches) != 1:
-        raise AssertionError((marker, len(matches)))
-    return matches[0]
+def find_block(example_id, path=REFERENCE):
+    return load_example(path, example_id, 'python')
 
 
 NAMESPACE = {}
-for marker in ['def parse_cny', 'def allocate_fen', 'def as_utc', 'def local_to_utc_strict']:
-    exec(compile(find_block(marker), str(REFERENCE), 'exec'), NAMESPACE)
+for example_id in ['money-parse-python', 'money-allocation-python', 'utc-python', 'dst-python']:
+    exec(compile(find_block(example_id), str(REFERENCE), 'exec'), NAMESPACE)
 JSON_NS = {'bounded_body': '{}', 'response_dto': {}}
-exec(compile(find_block('def finite_json_float'), str(REFERENCE), 'exec'), JSON_NS)
+exec(compile(find_block('json-boundaries-python'), str(REFERENCE), 'exec'), JSON_NS)
 MODEL_NS = {}
-exec(compile(find_block('class CreateOrder(BaseModel)'), str(REFERENCE), 'exec'), MODEL_NS)
+exec(compile(find_block('order-model-python'), str(REFERENCE), 'exec'), MODEL_NS)
 CONTEXT_NS = {}
-exec(compile(find_block('class RequestContextMiddleware'), str(REFERENCE), 'exec'), CONTEXT_NS)
+exec(compile(find_block('request-middleware-python'), str(REFERENCE), 'exec'), CONTEXT_NS)
 
 
 class ArtifactTests(unittest.TestCase):
@@ -95,10 +70,33 @@ class ArtifactTests(unittest.TestCase):
         files = list(SKILL.rglob('*.md'))
         self.assertTrue(files)
         graph = {}
+        example_ids = {}
         for file in files:
             with self.subTest(file=file.name):
                 content = file.read_text(encoding="utf-8")
-                list(fenced_blocks(content))
+                code_blocks = parse_blocks(content)
+                for block in code_blocks:
+                    if block.example_id is not None:
+                        self.assertNotIn(block.example_id, example_ids,
+                                         f'duplicate example ID across documents: {block.example_id}')
+                        example_ids[block.example_id] = file
+                if file.is_relative_to(SKILL / 'references'):
+                    code_lines = {number for block in code_blocks
+                                  for number, _ in enumerate(block.body.splitlines(), block.line)}
+                    prose = '\n'.join('' if number in code_lines else line
+                                      for number, line in enumerate(content.splitlines(), 1))
+                    # Ignore examples/comments without changing the source used by other checks.
+                    prose = re.sub(r'<!--.*?(?:-->|$)',
+                                   lambda match: re.sub(r'[^\n]', ' ', match[0]), prose, flags=re.S)
+                    headings = [line for line in prose.splitlines() if re.match(r'^#{1,6} ', line)]
+                    # A leading H1 is the document title, not a body section.
+                    if headings and headings[0].startswith('# '):
+                        headings = headings[1:]
+                    location = file.relative_to(SKILL).as_posix()
+                    self.assertIn('## 目录', headings,
+                                  f'{location}: missing standalone ## 目录')
+                    self.assertEqual(headings[0], '## 目录',
+                                     f'{location}: ## 目录 must precede the first body heading')
                 self.assertNotIn('[TODO:', content)
                 graph[file.resolve()] = set(local_links(file, SKILL))
         reached = set()

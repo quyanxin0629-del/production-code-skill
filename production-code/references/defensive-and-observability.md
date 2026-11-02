@@ -1,21 +1,45 @@
 # 维度三与维度四：防御性编程、异常与生产可观测性
 
-这是完整执行参考。涉及相应边界时读取对应部分；不要把结算、权限或日志规则机械应用到没有该需求的纯计算或 UI 任务。Python 基线 3.11+ / Pydantic 2；Java 按仓库目标版本，Spring Boot 3+ 常用 jakarta 包。端口和领域类型需接入现有项目。
+这是按章节查阅的执行参考。涉及相应边界时读取对应部分；不要把结算、权限或日志规则机械应用到没有该需求的纯计算或 UI 任务。Python 基线 3.11+ / Pydantic 2；Java 按仓库目标版本，Spring Boot 3+ 常用 jakarta 包。端口和领域类型需接入现有项目。
 
 ## 目录
 
-- D1 金额来源、十进制、整数与舍入
-- D2 分摊守恒、范围和溢出
-- D3 时间点、营业日、时区、DST 与时钟
-- D4 JSON 精度、未知字段、枚举与循环引用
-- D5 入口验证、清洗与业务合法性的分界
-- O1 异常分类与十条执行规则
-- O2 因果链、错误边界与事务
-- O3 请求上下文与全链路追踪
-- O4 日志成本、敏感数据、级别与采样
-- V 定向验证
+- D0 校验所有者；D1 金额精度；D2 分摊守恒与溢出
+- D3 时间与时区；D4 序列化；D5 Validation at the Gate
+- O1 异常分类；O2 因果链与日志边界；O3 全链路追踪；O4 日志；V 定向验证
 
 # 维度三：防御性编程与魔鬼业务细节
+
+## D0 校验所有者：边界完整，内部简洁
+
+| 层次 | 应承担的检查 |
+|---|---|
+| API / 网关、反序列化、跨信任边界 | 一次性限制类型、格式、长度 / 数量、数值与资源范围；拒绝非法结构，再交付已知模型。网关没有覆盖的字段仍由服务入口负责。 |
+| 独立 SDK / 公共基础设施 | 调用方与输入来源不完全受控时，在公开入口履行其声明的运行时契约；例如拒绝把 bool 当数量、在缓存哈希前限制键、验证池容量。按实际暴露面选择，不为理论上的任意对象滥加检查。 |
+| 已校验 DTO / Schema 后的内部业务层 | 直接依赖已建立的结构契约，不逐层重复类型分支或重新反序列化；仍验证执行时的授权、状态、余额和并发不变量。来源改变或新增信任 / 资源边界时重新评估。 |
+
+D1 / D2 的严格解析与 `type(w) is not int` 是公共边界示例，包含 Python 的 bool 属于 int 子类这一输入陷阱；不是要求每个金额计算或内部 CRUD 都复制这些分支。明确调用方、校验所有者及绕过路径，比到处放同一份校验更可维护。DTO 可被普通构造器或未校验路径绕过时，先收拢构造路径；类型注解本身不是运行时验证。
+
+以下片段承接 D5 已校验的 `CreateOrder`；`inventory` 是项目的租户条件写入端口。
+
+Bad：同一输入沿内部调用层重复结构校验。
+
+```python
+async def reserve_validated(command: CreateOrder, principal):
+    for line in command.lines:
+        if type(line.quantity) is not int or not 1 <= line.quantity <= 999:
+            raise ValueError("invalid quantity")
+    return await inventory.reserve(principal.tenant_id, command)
+```
+
+Good：内部直接使用模型；库存和租户不变量由写入条件保证。
+
+```python
+async def reserve_validated(command: CreateOrder, principal):
+    return await inventory.reserve(principal.tenant_id, command)
+```
+
+这不允许用“上层校验过”省略会变化的业务事实：DTO 的合法数量不会保证当前仍有库存。相关条件写入与影响行数验证见数据参考。
 
 ## D1 金额精度从输入开始保护
 
@@ -35,6 +59,7 @@ BigDecimal amount = new BigDecimal(19.99);
 
 Good：先确定边界格式；本例契约为非负 CNY 文本、整数最多 12 位、最多 2 位小数、不允许指数和千位分隔符。限制是示例业务范围，不是全币种规则。
 
+<!-- example: money-parse-python -->
 ```python
 import re
 from decimal import Decimal, Inexact, InvalidOperation, localcontext
@@ -43,6 +68,7 @@ CNY_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,2})?")
 CNY_QUANTUM = Decimal("0.01")
 
 def parse_cny(raw: str) -> Decimal:
+    # Public text boundary; internal Decimal calculations do not reparse it.
     if not isinstance(raw, str) or CNY_PATTERN.fullmatch(raw) is None:
         raise ValueError("invalid CNY amount")
     with localcontext() as context:
@@ -85,12 +111,15 @@ shares = [round(total / 3, 2)] * 3
 
 Good：最小单位整数 + 最大余数法；相同余数按稳定业务顺序打破平局。示例限制总额、单个权重和明细数，实际范围由业务确认。
 
+<!-- example: money-allocation-python -->
 ```python
 MAX_TOTAL_FEN = 10**14 - 1  # 对应 D1 的金额范围
 MAX_WEIGHT = 10**9
 MAX_PARTS = 10_000
 
 def allocate_fen(total_fen: int, weights: tuple[int, ...]) -> tuple[int, ...]:
+    # Public utility contract: reject bool and bound work at this entry.
+    # Already-validated internal callers do not repeat these checks.
     if (type(total_fen) is not int or not 0 <= total_fen <= MAX_TOTAL_FEN
             or type(weights) is not tuple or not 1 <= len(weights) <= MAX_PARTS):
         raise ValueError("invalid allocation")
@@ -138,6 +167,7 @@ LocalDateTime paidAt = LocalDateTime.now();
 
 Good：事件用明确时间点，时钟可注入；本地日期继续保留业务含义。
 
+<!-- example: utc-python -->
 ```python
 from datetime import datetime, timezone
 
@@ -174,6 +204,7 @@ Instant instant = local.atZone(zone).toInstant();
 
 Good：当接口只允许无歧义本地时间时，拒绝 gap / overlap；若业务允许重叠，要求调用方选择 offset / fold 并验证。
 
+<!-- example: dst-python -->
 ```python
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -281,6 +312,7 @@ payload = json.loads(unbounded_body)
 
 Good：网关 / 服务入口先限制正文、解压后尺寸与解析深度策略；对需要确定性键语义的协议拒绝重复键。
 
+<!-- example: json-boundaries-python -->
 ```python
 import json
 import math
@@ -326,6 +358,7 @@ async def create(payload: dict):
 
 Good：Pydantic 描述结构，身份从可信认证链路获得，业务规则由服务验证。
 
+<!-- example: order-model-python -->
 ```python
 from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -365,7 +398,7 @@ OrderView create(@AuthenticationPrincipal UserPrincipal principal,
 }
 ```
 
-鉴权链必须已要求身份存在。Pydantic strict 对 JSON / Python 模式有差异；Bean Validation 不会自动验证普通对象的所有内部调用。边界验证包括长度 / 数量 / 数值范围 / 必需字段，业务层负责归属、库存、状态与规则版本，数据库负责唯一性和并发条件。不能承诺“进核心层的数据 100% 永久合法”，因为业务状态会变化。
+鉴权链必须已要求身份存在。Pydantic strict 对 JSON / Python 模式有差异；Bean Validation 不会自动验证普通对象的所有内部调用。边界验证包括长度 / 数量 / 数值范围 / 必需字段，业务层直接使用已校验字段，负责归属、库存、状态与规则版本，数据库负责唯一性和并发条件；不要层层重复 Schema 已完成的类型 / 范围检查。不能承诺“进核心层的数据 100% 永久合法”，因为业务状态会变化。
 
 清洗只执行协议允许的规范化。展示名可按约定 trim；密码、Token、幂等键、签名原文、产品代码大小写不能随意改写。PATCH 区分未提供与 null，Python 用 model_fields_set；Java 需要显式 presence 表达，不能仅一个 nullable 字段混淆两种语义。
 
@@ -498,6 +531,7 @@ await handler()
 
 Good：ContextVar 保存小型关联值，使用 token 对称恢复；这是纯 ASGI 中间件，不依赖 BaseHTTPMiddleware 的任务边界行为。
 
+<!-- example: request-middleware-python -->
 ```python
 import re
 import uuid

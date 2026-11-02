@@ -11,9 +11,9 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.IntStream;
 import javax.net.ssl.*;
 
-public class MechanismTests {
-    /*__STRIPES__*/
+/*__STRIPES__*/
 
+public class MechanismTests {
     static final class Ledger {
         private final LocalStripes stripes = new LocalStripes();
         private final ConcurrentHashMap<String, Long> balances;

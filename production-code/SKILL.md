@@ -1,6 +1,6 @@
 ---
 name: production-code
-description: 编写、修复、重构或审查应用与库代码时，按仓库实际语言、框架和版本落实生产级正确性、可维护性、并发安全与故障恢复。支持 Python、Java 及其他语言适配；用于高质量代码实现、Code Review 和性能或稳定性改进，不用于纯排版或与代码无关的任务。
+description: 编写、修复、重构或审查应用与库代码时，按仓库实际语言、框架和版本落实生产级正确性、可维护性、并发安全与故障恢复。支持 Python、Java、TypeScript/Node/React、Go 及其他语言适配；用于高质量代码实现、Code Review 和性能或稳定性改进，不用于纯排版或与代码无关的任务。
 ---
 
 # 生产级代码工程
@@ -31,19 +31,26 @@ description: 编写、修复、重构或审查应用与库代码时，按仓库�
 
 ## 按需读取参考
 
-先读核心，再选实际语言与本次风险域；不要默认加载全部文件，不把 Python / Java 习惯强加给其他运行时。
+先按任务检索，再精读；不默认整篇读取核心或叠加所有语言指南。
+
+1. **首轮预算：最相关的 1～2 个参考文件或对应小节。** 先看文件顶部目录，或用 `rg -n '^#{1,3} ' <file>` 检索标题，再读取命中的章节及必要前后文；不要把命中一个关键词当作整篇加载的理由。
+2. 全栈任务按当前改动与风险选小节，例如 React 状态 + API 契约；服务含数据库不等于本次必须加载数据库、缓存、MQ 全文。优先定位仓库实现和调用链，而非先通读参考。
+3. 跨层不变量、版本行为或故障时序确实涉及第三份参考时，沿依赖逐段补读，解决当前疑点后停止。1～2 份是起始预算，不是阻止必要取证的硬上限。
+4. 路由表是索引，不是任务检查清单；不把 Python / Java 习惯强加给其他运行时。
 
 | 场景 | 文件 |
 |---|---|
-| 实质代码任务：维度一 / 二，结构、契约、集合、生命周期 | [references/core.md](references/core.md) |
+| 结构、建模、契约、集合、生命周期与遗留代码渐进重构 | [references/core.md](references/core.md) |
 | 完整维度三 / 四：金额、时间、序列化、校验、异常、追踪、日志 | [references/defensive-and-observability.md](references/defensive-and-observability.md) |
 | Python / FastAPI / asyncio / Pydantic / SQLAlchemy | [references/python.md](references/python.md) |
 | Java / Spring / JUC / MyBatis | [references/java.md](references/java.md) |
 | 维度五的 JUC 复合操作、分段锁、多锁顺序与快照发布 | [references/juc-locks.md](references/juc-locks.md) |
-| TypeScript / JavaScript、Go、Rust、C#、C / C++ 及其他语言 | [references/other-languages.md](references/other-languages.md) |
-| 维度六 / 七 / 八：MySQL、Redis、网络、MQ、滚动演进 | [references/data-and-resilience.md](references/data-and-resilience.md) |
-| 改动涉及外部 URL、文件 / 归档、进程调用、不可信反序列化或 HTML 输出 | [references/security-boundaries.md](references/security-boundaries.md) |
-| 测试选择、并发验证、性能证据与交付 | [references/verification.md](references/verification.md) |
+| TypeScript / Node / React：Promise、请求隔离与组件生命周期 | [references/typescript-node-react.md](references/typescript-node-react.md) |
+| Go：HTTP 连接复用、context、errgroup 与资源退出 | [references/go.md](references/go.md) |
+| Rust、C#、C / C++ 及未列出的语言适配 | [references/other-languages.md](references/other-languages.md) |
+| 数据库方言 / 事务、Redis、网络、MQ、优雅停机与滚动演进 | [references/data-and-resilience.md](references/data-and-resilience.md) |
+| 签名 / Token、租户与状态写入、外部 URL、文件、进程、反序列化或 HTML | [references/security-boundaries.md](references/security-boundaries.md) |
+| 测试选择、并发验证、性能证据、审查分级与反噪 | [references/verification.md](references/verification.md) |
 
 维度五的进程内并发模式在语言指南中；跨实例幂等、数据库原子性和流量治理在数据指南中。前端、CLI、嵌入式和纯计算库不需要无关的数据库 / 中间件规则。
 
@@ -57,6 +64,12 @@ description: 编写、修复、重构或审查应用与库代码时，按仓库�
 6. **演进兼容。** 混合版本运行时考虑旧读新写、新读旧写、回填与回滚窗口。不为小任务预先引入无关框架、缓存、队列或插件系统。
 
 涉及数据库读取时，先限定需要的列、行范围和页大小，再按相关 ID 批量加载必要关联或选择经计划验证的 JOIN；避免全量物化和逐条 N+1。单对象点查不预取未来可能需要的全库数据；全量导出采用有界分批或流式，并定义一致性语义。
+
+## 防御放在哪一层
+
+- 网关 / API、跨信任边界、独立 SDK 和公共基础设施负责类型、长度、容量与预算等完整输入契约；不能依靠静态类型注解假定不可信输入已经安全。
+- 经上层 DTO / Schema 校验的内部业务函数直接使用该契约，避免逐层重复 `isinstance`、排除 `bool` 或再解析数据。改变输入来源、绕过校验或出现新的资源边界时，才补对应检查；库存、权限、状态等会变化的业务事实仍需在执行点和存储条件中重验。
+- 参考中的严格数值校验、公共任务池、计时装饰器饱和计数是相应组件的边界实现，不是普通 CRUD 的默认样板。优先复用已配置的观测 SDK / 中间件，不为业务函数逐个生成全局计数器。
 
 ## 避免错误铁律
 
@@ -83,4 +96,8 @@ description: 编写、修复、重构或审查应用与库代码时，按仓库�
 
 检查调用方、失败路径、资源退出与兼容性，审阅实际 diff，不夹带无关重写。不为覆盖率写复述实现的测试，不为未测量的性能收益增加复杂度。
 
-实现交付简洁说明行为变化、关键约束、实际检查结果和影响判断的剩余限制。审查只报告有触发条件、影响、位置及修复方向的问题；证据不足标为待确认，不凑条数或夸大风险。
+实现交付简洁说明行为变化、关键约束、实际检查结果和影响判断的剩余限制。
+
+只读审查遵循 [verification.md 的审查契约](references/verification.md)：P0 / Critical 是需立即处置的严重资损、越权、数据破坏或服务失效；P1 / High 是可达边界 / 并发时序下的重要功能、事务或性能故障；P2 / Medium 是影响明确的预算、观测或契约缺陷。分级由实际影响、范围和可达性共同决定，不按关键词升级。
+
+单问题紧凑输出：`[级别] 问题 → 位置 → 触发前提 / 时序 → 具体影响 → 最小修复方向`。不报告已被上游确实拦截的假想风险、不在非热路径强推微优化、不将个人风格当缺陷；未知前提放在待确认项，不作为已确认发现，不凑条数。

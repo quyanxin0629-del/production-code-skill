@@ -4,12 +4,9 @@
 
 ## 目录
 
-- C1 卫语句与检查顺序
-- C2 表驱动、策略与状态机
-- C3 抽象层次与纯计算
-- C4 参数、空值、单位与布尔语义
-- C5 集合、流与分配
-- C6 生命周期与元编程
+- C1 卫语句；C2 表、策略、状态机；C3 单一抽象层次与纯计算
+- C4 参数与返回值契约；C5 集合、流与分配成本；C6 生命周期与元编程
+- C7 棕地演进；参考依据
 
 ## C1 卫语句缩短检查与处理的距离
 
@@ -232,6 +229,69 @@ async def wrapper(*args, **kwargs):
 ```
 
 装饰器 / AOP 明确控制流、叠加顺序、鉴权位置和异常传播；导入 / 类加载阶段不连接外部依赖。普通 lru_cache 不直接缓存 async 函数、生成器或可变请求结果。本地缓存限制条目与单项字节，定义业务键和失效策略。
+
+## C7 棕地演进：先锁定行为，再替换边界
+
+缺少测试时，先在可替换的 IO / 模块边界建立特征测试（Characterization Test）；黄金结果记录当前**可观察行为**，不是为旧实现所有细节背书。选择真实、脱敏且覆盖当前改动的输入，固定时钟 / 随机源，断言返回值、异常、持久化效果和外部端口调用。已知缺陷单独标记，先取得目标行为依据，不能靠“重构”悄悄改变协议。快照只规范化非业务字段，别把金额、状态或顺序差异一起抹掉。
+
+Bad：没有可观察行为保护，直接把旧规则与依赖一起重写；测试只验证新旧类名。
+
+```python
+service = NewBillingService(new_repository, new_rules)
+assert service.__class__.__name__ == "NewBillingService"
+```
+
+Good：先围住旧入口的行为，再使同一契约跑过候选实现；测试使用隔离存储 / 外部端口替身，绝不对真实付款双跑。
+
+```python
+def assert_billing_contract(service_factory, fixtures):
+    for case in fixtures:
+        ports = RecordingPorts()  # 每个 case 隔离状态；不连接生产依赖
+        service = service_factory(ports, clock=case.fixed_clock)
+        outcome = capture_outcome(lambda: service.bill(case.command))
+        assert outcome == case.expected_outcome
+        assert ports.business_effects == case.expected_effects
+
+# 第一阶段先对 legacy_factory 运行并审阅黄金结果；再用同组 fixture 验证候选。
+assert_billing_contract(legacy_factory, approved_fixtures)
+assert_billing_contract(candidate_factory, approved_fixtures)
+```
+
+`RecordingPorts`、`capture_outcome` 和 fixture 是测试适配器；捕获结果应包含契约内的异常类型 / 错误码，不把任意系统异常折叠成相同“失败”。特征测试锁住的是已有行为；新需求仍应添加独立的预期断言，不要求新代码永远复制已确认的旧错误。
+
+Bad：迁移期让两套实现分别扣款，然后忽略候选异常，以为随时可切回。
+
+```python
+old_result = await legacy.charge(command)
+new_result = await candidate.charge(command)
+return old_result
+```
+
+Good：用稳定路由逐步替换一个业务边界；只对已确认无副作用的快照计算做采样双跑，线上始终只有一个写入权威。
+
+```python
+async def quote(command, rollout):
+    snapshot = await source.load_snapshot(command)
+    if rollout.use_candidate(command.tenant_id):  # 稳定分组；开关快照在本次请求内不变
+        return candidate.calculate(snapshot)
+    result = legacy.calculate(snapshot)
+    if rollout.sample_shadow(command.tenant_id):
+        try:
+            observed = candidate.calculate(snapshot)  # 同一快照、纯计算，无远程调用
+        except Exception as exc:
+            differences.record_shadow_failure(type(exc).__name__)  # 不采集原始PII
+        else:
+            differences.record_bounded(result, observed)
+    return result
+```
+
+这是绞杀者模式（Strangler Fig）的模块级切口，不要求把单体拆成微服务。候选计算必须有已知输入 / 成本上界；耗时不可控时移到隔离且有界的影子执行通道，不给请求无界加负担。影子观测失败由既有不抛异常的有界端口处理，不在此复制一套指标基础设施。
+
+- 先明确流量分组、差异容忍度、停止条件、开关所有者和过期清理时间；按错误、差异与延迟证据扩大范围。回退开关走真实演练，不能仅存在配置项。
+- 数据写入双跑只有在明确的原子事务 / 可恢复复制协议下才成立；外部支付、邮件、消息发布不能“各执行一次比较”。新存储可通过受控复制 / 回填，再做只读对账；跨存储结果需说明复制延迟和版本水位。
+- 切换后若只更新新存储，旧路径已不一定可回退。先证明回退版本仍能读取新写数据，或准备逆向同步 / 前向修复；schema 与协议迁移见 [数据演进](data-and-resilience.md)。
+
+依据：[Martin Fowler：Legacy Seam](https://martinfowler.com/bliki/LegacySeam.html)、[Strangler Fig](https://martinfowler.com/bliki/StranglerFigApplication.html)、[AWS：Strangler fig](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/strangler-fig.html)。
 
 ## 参考依据
 

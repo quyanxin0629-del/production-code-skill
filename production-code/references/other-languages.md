@@ -2,84 +2,11 @@
 
 这是迁移决策指南，不声称与 Python / Java 参考具有相同深度。只加载实际项目的语言部分；先读 manifest、锁文件、编译目标、框架版本与仓库规范，再核对对应版本的官方资料。下列 Bad/Good 为局部模式，外部端口使用仓库已有实现。
 
-## TypeScript / JavaScript：类型擦除、事件循环和真实取消
+## 目录
 
-识别 Node/Deno/Bun、浏览器、SSR/React 等执行环境；`tsconfig` 的 strict 和目标版本以项目为准。`as` 不能验证网络输入；`readonly` 不保证运行时深冻结；字符串金额/大整数 ID 由接口契约决定，别用 JS Number 接收全范围 64 位 ID。Promise.race 超时不会自动停止原操作。
-
-Bad：假定 JSON 符合类型且网络调用会自行结束。
-```typescript
-const order = (await (await fetch(url)).json()) as Order;
-return order.amountCents;
-```
-Good：使用项目已有 schema 校验器；只有实际支持 signal 的调用才具备取消入口。
-```typescript
-const response = await fetch(url, {
-  signal: AbortSignal.timeout(1500), // 核对运行时支持与业务预算
-});
-if (!response.ok) throw new Error(`upstream status ${response.status}`);
-const payload: unknown = await response.json();
-const order = orderSchema.parse(payload); // 项目既有运行时 schema
-return order.amountCents;
-```
-需要同时继承调用方取消与本地截止时，核对 `AbortSignal.any` 的目标版本或用项目既有组合方案。不要把所有异常转换成空数组；拒绝的 Promise 要由明确任务所有者处理。大输入避免无界 Promise.all；流写入要遵循目标 API 的背压，CPU 重计算使用测量后选定的 worker 策略。
-
-来源：[TypeScript narrowing](https://www.typescriptlang.org/docs/handbook/2/narrowing.html)、[Node AbortSignal](https://nodejs.org/api/globals.html#class-abortsignal)。
-
-## React / 浏览器：副作用属于外部同步，交互需要可访问语义
-
-Bad：渲染时创建订阅，重渲染后积累监听器。
-```tsx
-function Price({ feed }: Props) {
-  feed.subscribe(updatePrice);
-  return <div onClick={buy}>Buy</div>;
-}
-```
-Good：Effect 对称清理，使用原生按钮表达动作。
-```tsx
-function Price({ feed, updatePrice, buy }: Props) {
-  useEffect(() => {
-    const unsubscribe = feed.subscribe(updatePrice);
-    return unsubscribe;
-  }, [feed, updatePrice]);
-  return <button type="button" onClick={buy}>Buy</button>;
-}
-```
-Props 中回调稳定性应由调用方设计，不能靠删掉依赖数组成员压住重跑。StrictMode 的开发期重执行会暴露不对称清理；不要用全局“只跑一次”标志掩盖它。数据加载优先沿用项目框架的 loader/query/cache；若自行 Effect 拉取，处理卸载取消和旧响应覆盖新状态。只有同步外部系统才需要 Effect，可直接派生的数据避免拷贝到第二份 state。
-
-UI 验证考虑加载/空/失败/重试状态、键盘焦点、可访问名称、重复提交和移动布局；不把 MySQL/Redis 检查强加给纯 UI 更改。
-
-来源：[React useEffect](https://react.dev/reference/react/useEffect)、[React 保持组件纯粹](https://react.dev/learn/keeping-components-pure)。
-
-## Go：每个 goroutine 有退出条件，每个 Rows 有资源与错误检查
-
-Bad：查询没有请求预算，遗漏资源关闭与迭代末尾错误。
-```go
-rows, _ := db.Query(query)
-for rows.Next() {
-    rows.Scan(&id)
-}
-```
-Good：以下位于返回 error 的函数中；query 使用驱动支持的参数占位符。
-```go
-ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-defer cancel()
-rows, err := db.QueryContext(ctx, query, customerID)
-if err != nil { return fmt.Errorf("query orders: %w", err) }
-defer rows.Close()
-for rows.Next() {
-    var id int64
-    if err := rows.Scan(&id); err != nil {
-        return fmt.Errorf("scan order: %w", err)
-    }
-    if err := consume(ctx, id); err != nil { return err }
-}
-return rows.Err()
-```
-Context 取消是否能中断驱动/远程动作由实现决定。数据写入还要检查必要的 Close/Commit 返回错误。启动 goroutine 前明确谁等待、谁取消、谁关闭 channel；固定 worker 或 errgroup + 容量限制，不能每条输入启动一个 goroutine。channel 发送需考虑下游退出后的阻塞，按需 select ctx.Done；不要从接收方随意关闭仍被发送的 channel。
-
-`error` 用 `%w` 保留因果，调用者用 errors.Is/As。一个装有 typed nil pointer 的 error interface 可能不等于 nil，成功路径直接返回 nil；共享 map 需同步，sync.Map 也不能让任意 check-then-act 自动原子。沿用仓库 gofmt/go vet/go test，涉及共享状态时选择相关 `-race` 测试。
-
-来源：[Go database querying](https://go.dev/doc/database/querying)、[context](https://pkg.go.dev/context)、[Pipelines and cancellation](https://go.dev/blog/pipelines)。
+- TypeScript / Node / React：见 [typescript-node-react.md](typescript-node-react.md)，只读运行时校验、任务所有权、SSR 隔离或 Effect 对应小节。
+- Go：见 [go.md](go.md)，只读 Transport / 响应体、errgroup 或 Rows 对应小节。
+- Rust / Tokio；C# / .NET；C / C++；未列出的语言、移动端、嵌入式与数据任务。先检索章节，不因多语言项目而整篇读取。
 
 ## Rust / Tokio：所有权不等于远程操作可取消
 

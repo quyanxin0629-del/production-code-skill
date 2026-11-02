@@ -2,6 +2,13 @@
 
 适用：改动触及 SQL/ORM、Redis、网络请求、消息消费或滚动发布。只读取涉及的章节；不要给纯前端或本地纯函数强行增加 Redis、MQ、重试和状态机。
 
+## 目录
+
+- 使用前确认；1. 短事务；2. 锁范围与 CAS；2.1 PostgreSQL 方言与事务失败
+- 3. N+1 与按需读取；4. 游标分页；5. 批量写入与谓词
+- 6. Redis 数据边界；7. 缓存一致性；8. Pipeline / Lua；9. 分布式锁
+- 10. 外部调用预算；11. 消息；12. 兼容演进；13. 服务级优雅停机；交付证据
+
 ## 使用前确认
 
 - 从依赖锁文件、驱动配置和 schema 确认数据库版本、隔离级别、索引、客户端超时及现有事务边界；不要根据框架名称猜默认值。
@@ -64,6 +71,66 @@ WHERE tenant_id = :tenant AND sku_id = :sku
 - 固定实体加锁顺序、缩短事务、限制等待；死锁重试应重跑完整事务，并排除无法安全重放的外部副作用。
 
 来源：[MySQL 8.4：锁语义](https://dev.mysql.com/doc/refman/8.4/en/innodb-locks-set.html)、[隔离级别与间隙锁](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking.html)。按项目版本复核，不把示例版本当作项目升级要求。
+
+## 2.1 PostgreSQL：事务失败与冲突语义按方言判断
+
+前面的 next-key / gap lock 说明针对 MySQL InnoDB。PostgreSQL 的同名 RR、锁定读与 upsert 不能由这些规则推导。先确认引擎、版本、隔离级别和唯一约束，再选并发协议。
+
+Bad：PostgreSQL 事务内捕获唯一冲突后继续执行 SQL；Python 的 catch 没有恢复数据库事务。
+
+```python
+async with session_factory.begin() as session:
+    try:
+        await repo.insert_and_flush(session, record)
+    except IntegrityError:
+        pass
+    await repo.write_audit(session, audit)  # 当前事务可能已 aborted
+```
+
+Good：若业务确实允许跳过这一条且继续同一外层事务，先建立 SAVEPOINT，退出嵌套块完成回滚后再处理**准确**的预期约束冲突。
+
+```python
+async with session_factory.begin() as session:
+    # 此处没有待 flush 的无关 ORM 变更；begin_nested() 会先 flush 已有待处理状态。
+    try:
+        async with session.begin_nested():
+            await repo.insert_and_flush(session, record)
+    except IntegrityError as exc:
+        if not is_exact_expected_duplicate(exc):
+            raise
+    await repo.write_audit(session, audit)
+```
+
+- PostgreSQL 普通 SQL 错误通常使当前事务进入失败状态，后续 SQL 不能直接继续；回滚整个事务或回滚到错误前的 SAVEPOINT 才能恢复。错误在创建 SAVEPOINT 之前的 flush、连接丢失、提交失败等，不能由这个小块兜底。
+- SQLAlchemy `begin_nested()` 不是独立提交，也不能通过 `session.commit()` 只提交 savepoint；2.x 的 session commit 作用于最外层事务。保持上下文边界；只有可部分成功的业务才用此方案，否则直接回滚整体。inbox 消费示例选择退出并回滚整个事务，也是正确路径。
+
+Bad：把 PostgreSQL 的缺失行 `FOR UPDATE` 当作“为不存在的键预约位置”。
+
+```sql
+BEGIN;
+SELECT id FROM accounts WHERE tenant_id = :tenant AND external_id = :key FOR UPDATE;
+-- 返回零行并不阻止另一事务插入同一业务键。
+INSERT INTO accounts (tenant_id, external_id) VALUES (:tenant, :key);
+COMMIT;
+```
+
+Good：创建唯一实体依赖存储唯一约束；按明确冲突目标决定插入还是更新，不靠先查不存在。
+
+```sql
+-- schema 保证 UNIQUE (tenant_id, external_id)；固定初始字段在服务端生成。
+INSERT INTO accounts (tenant_id, external_id, display_name)
+VALUES (:tenant, :key, :name)
+ON CONFLICT (tenant_id, external_id) DO NOTHING
+RETURNING id;
+-- 无返回行：该唯一键已存在（也可能由并发插入胜出）；不能因此任意重放副作用。
+```
+
+- PostgreSQL `FOR UPDATE` 锁住实际取得的行，不能锁住不存在的业务键；并发更新时的等待、重检或序列化失败取决于隔离级别。`SKIP LOCKED` 适合可跳过工作项的队列，不适合完整业务查询。
+- RC 下 `ON CONFLICT DO UPDATE` 为冲突目标提供原子的插入或更新选择（仍可能因其他约束等报错）；它可能更新本语句快照普通 SELECT 尚不可见的并发冲突行。避免用“无意义更新”仅为了返回 ID，额外写版本、触发器与锁都是真实成本。
+- `DO NOTHING` 可能因本语句快照不可见的并发记录而不插入；同一语句里的 SELECT / CTE 不保证随即读出该记录。RC 下可用下一条语句的新快照读取；期间仍可能删除，需定义有界重试 / 冲突结果。RR / Serializable 下不能照搬这个快照刷新假设，序列化失败重试完整事务。
+- 同一 key 携带不同业务载荷不能静默视为幂等成功；明确比较请求指纹 / 权威参数。ON CONFLICT 不提供外部副作用恰好一次，唯一键与租户边界必须一致。
+
+来源：[PostgreSQL：事务](https://www.postgresql.org/docs/current/tutorial-transactions.html)、[隔离与 ON CONFLICT](https://www.postgresql.org/docs/current/transaction-iso.html)、[INSERT](https://www.postgresql.org/docs/current/sql-insert.html)、[显式锁](https://www.postgresql.org/docs/current/explicit-locking.html)、[SQLAlchemy：SAVEPOINT](https://docs.sqlalchemy.org/en/20/orm/session_transaction.html#using-savepoint)。这些说明需在目标数据库的集成测试中验证，Python 替身不能证明真实锁 / aborted 行为。
 
 ## 3. N+1：查询次数必须随业务批次有界
 
@@ -247,6 +314,7 @@ if stock >= quantity:
 
 **Good：把有限的检查与修改放在一个脚本；返回约定码。**
 
+<!-- example: stock-reserve-lua -->
 ```lua
 -- 规范十进制整数限制在 Lua double 可精确表示的范围；先验证再读写。
 local function safe_uint(raw)
@@ -330,6 +398,7 @@ while True:
 
 **Good：仅对可安全重放的读操作采用有界重试；底层适配器负责分类异常。**
 
+<!-- example: retry-budget-python -->
 ```python
 import asyncio
 import math
@@ -394,6 +463,7 @@ await apply_business_effect(message)  # ack 之后失败会丢处理
 
 **Good：发送意图与业务同事务，消费去重与本地副作用同事务。**
 
+<!-- example: inbox-consume-python -->
 ```python
 async with session_factory.begin() as session:
     await repo.save_order(session, order)
@@ -455,6 +525,49 @@ ALTER TABLE customers ADD COLUMN display_name VARCHAR(200) NULL;
 - 回填结束不等于清理安全：确认后台任务、长寿命消费者、报表、CDC 和回滚版本均不再依赖旧结构。
 - 只让新代码双写，不能阻止共存期旧实例把 name 改新而 display_name 留旧；不能据“新列非空”提前切换读取。若必须在旧写入者仍运行时读新列，需部署覆盖所有写路径的触发器 / 同步机制，明确原子性或可接受延迟并验证。
 - 回填不能只填 NULL：共存期已填的新列也可能陈旧。停旧写入者后按权威旧列重算，并用版本 / 当前源值条件及冲突重试保护。回滚若恢复旧写入者，先恢复旧列权威读取或保持有效同步，避免再次产生陈旧新列。
+
+## 13. 服务级优雅停机：先关入口，再排空，最后关依赖
+
+停机入口可以是 SIGTERM、框架生命周期或受控管理操作。复用框架既有钩子，停机动作幂等；不要再注册相互竞争的全局 signal handler。就绪状态与存活检查分开：下线时 readiness 不再接流量，不能靠故意破坏 liveness 触发过早强杀。
+
+Bad：先关闭依赖，再取消所有任务；已接收消息可能被提前 ack，付款也可能只执行了一半。
+
+```python
+await database.dispose()
+await http_client.aclose()
+for task in active_tasks:
+    task.cancel()
+```
+
+Good：生命周期适配器提供以下协议，使用同一 monotonic 截止时间覆盖所有阶段。代码是可测试的编排端口，不替代服务器 / broker 的真实关闭 API。
+
+<!-- example: shutdown-service-good -->
+```python
+import asyncio
+
+async def shutdown_service(runtime, *, deadline):
+    # 同一事件循环内同步关闸，不等待路由传播后才阻止本进程接新活。
+    runtime.mark_unready()
+    runtime.reject_new_work()
+    async with asyncio.timeout_at(deadline):
+        await runtime.stop_pulling()       # 停止新拉取；保留已有消息的提交/ack能力
+        await runtime.drain_inflight()    # workers/DB/HTTP仍活着；允许已接收请求完成
+        await runtime.drain_queue()       # 生产者已停止后才判断排空
+        await runtime.stop_workers()      # 所有任务已退出，不能只发cancel不await
+        await runtime.close_consumer()    # 最后提交/ack完成后关闭消费会话
+        await runtime.close_executor()    # 线程仍使用的依赖此时不能先关闭
+        await runtime.close_database()
+        await runtime.close_clients()
+```
+
+- `deadline` 来自当前 `loop.time()`，启动停机时计算一次；各步骤使用剩余预算，不在每阶段重新获得完整超时。队列排空包含已出队但仍在执行的任务（如 Queue.join + 只有处理完成 / 已持久化恢复后才 task_done），不等于 `qsize() == 0`。
+- 请求 / 拉取停止与负载均衡摘除之间有传播窗口，已建立 keep-alive / 长连接也可能继续送达；本进程 admission gate 先拒绝新工作。反向代理、服务器、broker 的停止接口需实测。readiness 不证明入口已关；关闭 consumer 也不是一开始就丢弃未 ack 工作。
+- 纯读 / 可重算任务可取消并等待 finally 释放资源。资金、邮件、消息发布等副作用不可把 cancel 当撤销；接受前先有持久化意图 / outbox / broker未确认消息，排空超时后由租约、幂等键和恢复流程接管。内存队列若是唯一副本，不能声称强杀仍不丢；要求“不丢”时先改接收持久化协议，停机最后一刻临时落盘来不及兜住崩溃。
+- 超时或阶段错误需要记录尚未完成的工作 / 恢复水位并向进程监督器报告非完整退出。不要在 finally 不分顺序关闭仍被活跃任务使用的依赖；也不要无期限 shield 到平台强杀。恢复日志不记录原始凭证或完整业务载荷。
+- 上述 timeout 依赖协作式取消，不是强制终止线程或阻塞 C 扩展的保证。取消后的 finally 若继续等待，退出仍可能超出 deadline；清理也必须合作并约束等待，不能宣称这个编排提供硬实时终止。线程池任务要自己接受停止信号 / 期限；`shutdown(wait=True)` 阻塞也不能靠包一层 async timeout 变成可中断。让进程监督器的最终强杀期限兜住坏组件，持久化协议负责正确性。
+- 平台期限需覆盖路由摘除、在途最长处理、队列上限及清理预算，并留余量。Kubernetes 的 preStop 已计入终止宽限期；EndpointSlice 置 terminating / ready=false 与节点信号处理并非顺序原子步骤，不能假设收到 SIGTERM 前所有路由已停止。Spring 的每阶段 timeout 也不自动等于进程总期限，按部署中的实际版本核对。
+
+来源：[Kubernetes：Pod termination](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination-flow)、[Endpoint termination flow](https://kubernetes.io/docs/tutorials/services/pods-and-endpoint-termination-flow/)、[Spring Boot：Graceful Shutdown](https://docs.spring.io/spring-boot/reference/web/graceful-shutdown.html)、[Python：Timeouts / Task cancellation](https://docs.python.org/3.11/library/asyncio-task.html)。验证应包括停机中并发到来的新请求、在途任务、满队列、超时、未确认消息及重复投递恢复，不能只断言 close 被调用。
 
 ## 交付时只报告与本次改动相关的证据
 

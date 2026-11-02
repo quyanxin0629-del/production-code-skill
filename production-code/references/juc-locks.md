@@ -2,6 +2,11 @@
 
 用于 Java 17+ 共享内存状态；数据库与分布式一致性另按对应参考处理。先列出不变量及参与读写的所有路径，再选工具。不要从“读多”“用了并发容器”直接推导正确性。
 
+## 目录
+
+- 1. 并发容器；2. 固定分段锁；3. 多键操作
+- 4. 读多写少；验证重点
+
 ## 1. 并发容器：单方法安全不等于多个调用组成原子事务
 
 **Bad**：两个线程都可能通过检查，后一次替换使前一个计数器的增量丢失。
@@ -36,6 +41,7 @@ synchronized (globalLock) { updateLocalState(orderId); }
 
 **Good**：应用中共享同一个 LocalStripes 实例，固定哈希映射；超时值只是示例预算。
 
+<!-- example: juc-stripes-java -->
 ```java
 final class LocalStripes {
     private final ReentrantLock[] locks = IntStream.range(0, 256)
@@ -76,6 +82,7 @@ finally { lockFor(to).unlock(); lockFor(from).unlock(); }
 
 **Good**：以下方法添加到上一节 LocalStripes；每条多键更新路径遵守同一排序协议。
 
+<!-- example: juc-multikey-java -->
 ```java
 void withKeys(Collection<String> keys, Duration budget, Runnable update)
         throws InterruptedException, TimeoutException {
@@ -117,6 +124,7 @@ balances.put(to, Math.addExact(balances.get(to), amount));
 
 **Good**：以下为进程内、预先初始化且不增删账户的余额模型；所有写入和需要一致结果的读取都由同一个 `stripes` 保护。余额用非负 `long` 最小单位，转入转出必须不同；这个例子维护非负和转账总额守恒，不承担数据库持久性。
 
+<!-- example: juc-transfer-java -->
 ```java
 // 共享字段：private final ConcurrentHashMap<String, Long> balances;
 // 共享字段：private final LocalStripes stripes;
@@ -149,6 +157,7 @@ rates.get().put("vip", 500);  // 引用的原子访问不能保护内部 HashMap
 
 **Good**：只发布由不可变值构成的完整快照；更新函数允许重试，因此保持纯计算。
 
+<!-- example: juc-snapshot-java -->
 ```java
 record Rules(Map<String, Integer> rates, long version) {
     Rules { rates = Map.copyOf(rates); }

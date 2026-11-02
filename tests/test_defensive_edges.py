@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
+from example_support import load_example
 
 try:
     from lupa.lua51 import LuaRuntime
@@ -27,16 +28,8 @@ DEFENSIVE = ROOT / "production-code/references/defensive-and-observability.md"
 DATA = ROOT / "production-code/references/data-and-resilience.md"
 
 
-def example(path, function, initial=None, *, definitions_only=False):
-    matches = []
-    for block in re.findall(r"```python\n(.*?)\n```", path.read_text(encoding="utf-8"), re.S):
-        tree = ast.parse(block)
-        if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-               and node.name == function for node in tree.body):
-            matches.append(tree)
-    if len(matches) != 1:
-        raise AssertionError((function, len(matches)))
-    tree = matches[0]
+def example(path, example_id, initial=None, *, definitions_only=False):
+    tree = ast.parse(load_example(path, example_id, "python"))
     if definitions_only:
         tree.body = [node for node in tree.body if isinstance(
             node, (ast.Import, ast.ImportFrom, ast.ClassDef,
@@ -48,7 +41,7 @@ def example(path, function, initial=None, *, definitions_only=False):
 
 class DefensiveEdgeTests(unittest.TestCase):
     def test_money_remains_exact_under_hostile_decimal_context(self):
-        parse = example(DEFENSIVE, "parse_cny")["parse_cny"]
+        parse = example(DEFENSIVE, "money-parse-python")["parse_cny"]
         with localcontext() as context:
             context.prec = 2
             context.traps[Inexact] = True
@@ -59,7 +52,7 @@ class DefensiveEdgeTests(unittest.TestCase):
                 parse(raw)
 
     def test_allocation_enforces_resource_and_type_boundaries(self):
-        namespace = example(DEFENSIVE, "allocate_fen")
+        namespace = example(DEFENSIVE, "money-allocation-python")
         allocate = namespace["allocate_fen"]
         maximum = namespace["MAX_TOTAL_FEN"]
         weights = (0, namespace["MAX_WEIGHT"], namespace["MAX_WEIGHT"])
@@ -75,7 +68,7 @@ class DefensiveEdgeTests(unittest.TestCase):
                 allocate(total, parts)
 
     def test_utc_year_edges_have_explicit_rejection(self):
-        convert = example(DEFENSIVE, "as_utc")["as_utc"]
+        convert = example(DEFENSIVE, "utc-python")["as_utc"]
         for instant in (datetime.min.replace(tzinfo=timezone(timedelta(hours=14))),
                         datetime.max.replace(tzinfo=timezone(timedelta(hours=-14)))):
             with self.assertRaises(ValueError) as raised:
@@ -85,7 +78,7 @@ class DefensiveEdgeTests(unittest.TestCase):
                          datetime.max.replace(tzinfo=timezone.utc))
 
     def test_local_time_year_edge_and_non_hour_dst(self):
-        resolve = example(DEFENSIVE, "local_to_utc_strict")["local_to_utc_strict"]
+        resolve = example(DEFENSIVE, "dst-python")["local_to_utc_strict"]
         with self.assertRaises(ValueError):
             resolve(datetime.max, ZoneInfo("America/New_York"))
         zone = ZoneInfo("Australia/Lord_Howe")
@@ -96,7 +89,7 @@ class DefensiveEdgeTests(unittest.TestCase):
                          datetime(2024, 10, 5, 15, 45, tzinfo=timezone.utc))
 
     def test_json_nested_duplicates_exponents_and_id_precision(self):
-        namespace = example(DEFENSIVE, "finite_json_float",
+        namespace = example(DEFENSIVE, "json-boundaries-python",
                             {"bounded_body": "{}", "response_dto": {}})
 
         def parse(raw):
@@ -123,7 +116,7 @@ class TransientReadFailure(Exception):
 
 class RetryBudgetTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.namespace = example(DATA, "read_with_budget",
+        self.namespace = example(DATA, "retry-budget-python",
                                  {"TransientReadFailure": TransientReadFailure})
         self.read = self.namespace["read_with_budget"]
 
@@ -272,7 +265,7 @@ class ConsumerFlowTests(unittest.IsolatedAsyncioTestCase):
             if self.ack_failure:
                 raise self.ack_failure
 
-        namespace = example(DATA, "consume", {
+        namespace = example(DATA, "inbox-consume-python", {
             "session_factory": SimpleNamespace(begin=Transaction),
             "inbox": SimpleNamespace(insert_and_flush=insert),
             "consumer_name": "billing",
@@ -347,8 +340,7 @@ class LuaBoundaryTests(unittest.TestCase):
         runtime.globals().redis = runtime.table_from({"call": redis_call})
         runtime.globals().KEYS = runtime.table_from(keys)
         runtime.globals().ARGV = runtime.table_from((quantity,) if args is None else args)
-        blocks = re.findall(r"```lua\n(.*?)\n```", DATA.read_text(encoding="utf-8"), re.S)
-        script = next(block for block in blocks if "DECRBY" in block)
+        script = load_example(DATA, "stock-reserve-lua", "lua")
         return runtime.execute(script), current[0], calls
 
     def test_bad_quantity_is_rejected_before_any_key_access(self):

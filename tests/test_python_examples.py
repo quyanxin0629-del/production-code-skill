@@ -3,8 +3,8 @@
 import asyncio
 import inspect
 from pathlib import Path
-import re
 import unittest
+from example_support import load_example
 
 from pydantic import ValidationError
 
@@ -15,19 +15,15 @@ REFERENCE = (
 )
 
 
-def example(marker, **ports):
-    blocks = re.findall(r"```python\n(.*?)\n```", REFERENCE.read_text(encoding="utf-8"), re.S)
-    matches = [block for block in blocks if marker in block]
-    if len(matches) != 1:
-        raise AssertionError(f"expected one Python example containing {marker!r}")
+def example(example_id, **ports):
     namespace = dict(ports)
-    exec(compile(matches[0], str(REFERENCE), "exec"), namespace)
+    exec(compile(load_example(REFERENCE, example_id, "python"), str(REFERENCE), "exec"), namespace)
     return namespace
 
 
 class TimedTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_for_execution_and_preserves_metadata_and_return_identity(self):
-        namespace = example("def timed(emit)")
+        namespace = example("timed-python")
         ticks = iter((100, 350))
         namespace["perf_counter_ns"] = lambda: next(ticks)
         events = []
@@ -63,7 +59,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_metric_failure_does_not_replace_success(self):
-        timed = example("def timed(emit)")["timed"]
+        timed = example("timed-python")["timed"]
         emitted = []
         result = object()
 
@@ -78,7 +74,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event[1] for event in emitted], ["ok"])
 
     async def test_metric_failure_does_not_replace_business_exception(self):
-        timed = example("def timed(emit)")["timed"]
+        timed = example("timed-python")["timed"]
         emitted = []
         failure = LookupError("business failure")
 
@@ -95,7 +91,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event[1] for event in emitted], ["error"])
 
     async def test_metric_failure_does_not_replace_cancellation(self):
-        timed = example("def timed(emit)")["timed"]
+        timed = example("timed-python")["timed"]
         entered = asyncio.Event()
         cleaned = asyncio.Event()
         emitted = []
@@ -127,7 +123,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event[1] for event in emitted], ["cancelled"])
 
     async def test_repeated_metric_failures_remain_visible_with_bounded_diagnostics(self):
-        namespace = example("def timed(emit)")
+        namespace = example("timed-python")
 
         def failed_emit(*event):
             raise RuntimeError("metrics unavailable")
@@ -155,7 +151,7 @@ class TimedTests(unittest.IsolatedAsyncioTestCase):
 
 class ModelTests(unittest.TestCase):
     def test_quantity_is_strict_bounded_and_cannot_supply_tenant(self):
-        model = example("class CreateItem(BaseModel)")["CreateItem"]
+        model = example("item-model-python")["CreateItem"]
         for value in (1, 999):
             self.assertEqual(model.model_validate({"quantity": value}).quantity, value)
         for value in (True, False, 0, 1000, 1.0, "1", None):
@@ -167,7 +163,7 @@ class ModelTests(unittest.TestCase):
 
 class CacheTests(unittest.TestCase):
     def setUp(self):
-        self.namespace = example("def parse_columns")
+        self.namespace = example("cache-context-python")
 
     def test_cached_values_are_immutable_and_entry_count_is_bounded(self):
         parse = self.namespace["parse_columns"]
@@ -193,7 +189,7 @@ class CacheTests(unittest.TestCase):
 
 class ContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_nested_calls_restore_parent_context_after_failure_and_cancel(self):
-        namespace = example("async def dispatch")
+        namespace = example("cache-context-python")
         rid = namespace["request_id"]
         dispatch = namespace["dispatch"]
         failure = LookupError("expected")
@@ -219,7 +215,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
             rid.reset(token)
 
     async def test_concurrent_calls_are_isolated(self):
-        namespace = example("async def dispatch")
+        namespace = example("cache-context-python")
         rid = namespace["request_id"]
         dispatch = namespace["dispatch"]
         entered = 0
@@ -245,7 +241,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
 
 class ResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_response_is_open_during_writes_and_closed_on_every_exit(self):
-        copy_body = example("async def copy_body")["copy_body"]
+        copy_body = example("stream-copy-python")["copy_body"]
         for mode in ("success", "status", "read", "write", "cancel"):
             with self.subTest(mode=mode):
                 opened = False

@@ -2,16 +2,12 @@ import asyncio
 import unittest
 
 from pathlib import Path
-import re
+from example_support import load_example
 
 # Execute the exact bounded-batch example included in the distributed Skill.
 _reference = Path(__file__).resolve().parents[1] / 'production-code/references/python.md'
-_blocks = re.findall(r'```python\n(.*?)\n```', _reference.read_text(encoding="utf-8"), re.S)
-_matches = [block for block in _blocks if 'async def run_jobs' in block]
-if len(_matches) != 1:
-    raise AssertionError('expected one bounded-batch example')
 _namespace = {}
-exec(compile(_matches[0], str(_reference), 'exec'), _namespace)
+exec(compile(load_example(_reference, 'bounded-batch-python', 'python'), str(_reference), 'exec'), _namespace)
 run_jobs = _namespace['run_jobs']
 
 

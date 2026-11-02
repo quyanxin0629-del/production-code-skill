@@ -2,6 +2,11 @@
 
 仅在目标项目包含 Python 时读取。先检查 `pyproject.toml`、锁文件、Python 版本、ASGI 运行时及已采用的测试工具；示例使用 Python 3.11+、Pydantic 2、SQLAlchemy 2.x，不能在旧项目中悄悄升级运行时。以下代码是模式片段，`repo`、`sink` 等代表项目现有端口。
 
+## 目录
+
+- 1. 执行模型；2. 入口与内部契约；3. Session 所有权；4. 有界任务池
+- 5. 防御性参考；6. 流式生命周期；7. 观测装饰器；8. 缓存与上下文；验证选择
+
 ## 1. 选择执行模型，别让 async 外观掩盖阻塞
 
 Bad：阻塞整个事件循环。
@@ -28,6 +33,7 @@ async def create(quantity: int, tenant_id: int):
     return await repo.insert(tenant_id, quantity)
 ```
 Good：校验数量，租户从认证主体获得。
+<!-- example: item-model-python -->
 ```python
 from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
@@ -39,6 +45,8 @@ class CreateItem(BaseModel):
 async def create(command: CreateItem, principal):
     return await repo.insert(principal.tenant_id, command.quantity)
 ```
+上面的 `CreateItem` 是入口验证所有者；内部服务直接使用 `command.quantity`，不再逐层检查 `isinstance` 或排除 bool。只有新增输入来源、绕过模型的构造路径或新的资源边界才增加相应校验；租户授权、状态和库存仍要在执行点及存储条件中重验。
+
 Pydantic 的 strict 在 Python/JSON 输入模式下存在类型特例，按官方 conversion table 核对；`frozen` 是浅层约束，嵌套可变容器仍可变化。`T | None` 不等于“字段有默认值”；PATCH 用 `model_fields_set` 区分未提供与显式清空。写入入口可拒绝未知字段，消费外部事件则按兼容性契约选择忽略/保存，不能全局强制一种策略。
 
 来源：[Pydantic strict mode](https://docs.pydantic.dev/latest/concepts/strict_mode/)、[Models](https://docs.pydantic.dev/latest/concepts/models/)。
@@ -65,7 +73,8 @@ Bad：即便每个任务内有 Semaphore，先创建百万协程仍消耗大量�
 ```python
 await asyncio.gather(*(fetch(key) for key in million_ids))
 ```
-Good：异步输入 + 固定工作任务 + 有界队列。以下模板选择任一子任务取消即终止批次，并保留原始失败类型；支持 None 作为业务输入。
+Good：异步输入 + 固定工作任务 + 有界队列。这是允许独立调用方传入配置的公共工具模板，类型 / 有限值检查属于其公开边界；普通业务不需要在每次调用前再复制检查。以下模板选择任一子任务取消即终止批次，并保留原始失败类型；支持 None 作为业务输入。
+<!-- example: bounded-batch-python -->
 ```python
 import asyncio
 import math
@@ -85,6 +94,7 @@ async def run_jobs(
     cancellation cleanup can exceed either budget. The caller owns the source
     resources and any idempotency required by handler side effects.
     """
+    # Public utility configuration boundary, not a per-layer CRUD pattern.
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
     for name, timeout in (
@@ -159,6 +169,7 @@ async def open_chunks(client, url):
         return response.aiter_bytes()
 ```
 Good：消费期间持续持有响应，输出 await 提供背压。
+<!-- example: stream-copy-python -->
 ```python
 async def copy_body(client, url, sink):
     async with client.stream("GET", url) as response:
@@ -182,7 +193,8 @@ def timed(fn):
         return result
     return wrapper
 ```
-Good：等待实际执行，finally 记录；emit 为应用注入的有界非 IO 事件入口。
+Good：以下是公共观测组件的隔离实现，等待实际执行，finally 记录；emit 为应用注入的有界非 IO 事件入口。已有成熟中间件 / 观测 SDK 时直接复用，普通业务函数不复制整套装饰器和全局诊断状态。
+<!-- example: timed-python -->
 ```python
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -192,6 +204,8 @@ from typing import ParamSpec, TypeVar
 P = ParamSpec("P")
 R = TypeVar("R")
 
+# Component-local, single-event-loop fallback diagnostics only.
+# This is not request/business state or a counter to copy into CRUD functions.
 _EMIT_FAILURE_LIMIT = (1 << 63) - 1
 _timing_emit_failures = 0
 
@@ -228,6 +242,8 @@ def timed(emit):
 ```
 emit 契约：同步、非阻塞，固定小字段、有界 queue.put_nowait、满时计数并丢弃观测事件，不抛可预期的满队列异常；消费者受监督并上报丢弃量。装饰器另外隔离普通观测异常，保留原返回值、业务异常和取消，并递增固定大小的进程内饱和计数；应用健康检查须读取 `timing_diagnostics()` 的失败计数并告警，不能把持续观测故障当成正常。包装器与诊断读取限定于同一事件循环；多线程、多事件循环须另设同步与聚合。该计数不保留异常对象，不发起可能继续失败的日志 IO，也不替代 emit 的满队列丢弃量。
 
+饱和计数仅为该公共组件在 emit 自身失效时保留有界诊断状态；已有等价的受控失败指标时复用它，不再叠加一份全局计数器。它不参与业务正确性判断。
+
 这是受控观测端口的隔离边界，不是吞掉业务异常的通用模板。这里不捕获 KeyboardInterrupt/SystemExit 等 BaseException 控制信号，emit 也不得用 CancelledError 表示指标失败。wraps 维护反射元信息，ParamSpec 维护静态参数类型，两者不能互相替代；跨模块延迟注解和 FastAPI DI 仍需验证。
 
 来源：[wraps](https://docs.python.org/3.11/library/functools.html#functools.wraps)、[ParamSpec](https://docs.python.org/3.11/library/typing.html#typing.ParamSpec)。
@@ -242,6 +258,7 @@ async def load_user(user_id):
 current_user["tenant_id"] = tenant_id
 ```
 Good：普通 lru_cache 用于有界、纯计算、不可变结果；请求上下文用 token 恢复。
+<!-- example: cache-context-python -->
 ```python
 from contextvars import ContextVar
 from functools import lru_cache
@@ -253,7 +270,8 @@ def _parse_columns(columns: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(name.strip() for name in columns)
 
 def parse_columns(columns: tuple[str, ...]) -> tuple[str, ...]:
-    # Example protocol bounds: validate before LRU hashes/retains the key.
+    # Public protocol boundary: validate once before LRU hashes/retains the key.
+    # An internal caller already behind this boundary need not revalidate.
     if not isinstance(columns, tuple) or len(columns) > 64:
         raise ValueError("expected at most 64 column names in a tuple")
     if any(not isinstance(name, str) or len(name) > 128 for name in columns):

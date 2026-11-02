@@ -2,6 +2,13 @@
 
 按任务读取相关小节；不要一次照搬全部模式。下列代码是集成模式，`mapper`、`client`、DTO 与业务异常应接到仓库真实类型，完成编译后才能报告可运行。
 
+## 目录
+
+- 适配版本与执行模型；1. 输入契约；2. 金额、时间与可空返回；3. 集合与 Stream
+- 4. MVC 与 WebFlux；5. 事务与代理；6. MDC；7. 平台线程池
+- 8. CompletableFuture；9. 虚拟线程；10. MyBatis 参数
+- 11. 查询形态；12. Cursor；交付前的针对性验证
+
 ## 适配版本与执行模型
 
 - 先读 `pom.xml`、Gradle toolchain、依赖锁、运行镜像和 CI；Java 编译版本、运行版本、Spring Boot / Spring Framework 版本分别确认。
@@ -222,6 +229,7 @@ return CompletableFuture.supplyAsync(() -> blockingClient.fetch())
 
 **Good**：对具体异步客户端保留原始操作句柄与有限请求预算。以下为 JDK HttpClient 状态探测；URI 来自可信配置，客户端在应用启动时复用并配置 connect timeout。
 
+<!-- example: http-probe-java -->
 ```java
 CompletableFuture<HttpResponse<Void>> probe(
         HttpClient client, URI trustedUri, Duration budget) {

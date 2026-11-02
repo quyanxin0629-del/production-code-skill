@@ -12,10 +12,12 @@
 | references/python.md | Python、FastAPI、asyncio、Pydantic、SQLAlchemy；有界并发与取消 |
 | references/java.md | Java、Spring、JUC、MyBatis；事务代理、线程池、Future 与游标 |
 | references/juc-locks.md | 并发容器复合操作、分段锁、锁顺序、读写与不可变快照 |
-| references/data-and-resilience.md | 维度六 / 七 / 八：MySQL、Redis、外部调用、MQ、兼容迁移 |
-| references/other-languages.md | TS/JS、React、Go、Rust、C#、C/C++ 和未知语言适配 |
-| references/verification.md | 风险相称的测试、并发 / 故障验证、性能证据 |
-| references/security-boundaries.md | 外部 URL、文件 / 归档、进程调用、HTML 与不可信反序列化 |
+| references/data-and-resilience.md | MySQL / PostgreSQL、Redis、外部调用、MQ、停机与兼容迁移 |
+| references/typescript-node-react.md | Promise 所有权、SSR 请求隔离、React 生命周期 |
+| references/go.md | HTTP Transport、响应体复用、context 与 errgroup |
+| references/other-languages.md | Rust、C#、C/C++ 和未知语言适配 |
+| references/verification.md | 风险相称的验证、P0/P1/P2 只读审查与反噪 |
+| references/security-boundaries.md | 签名、租户与状态写入、外部 URL、文件、进程、HTML、反序列化 |
 | agents/openai.yaml | Codex 界面元数据，保持默认自动匹配能力 |
 
 Python 和 Java 提供深度参考；其他语言提供执行模型、关键风险和正反例，并要求按项目版本核对 API。它不声称穷尽所有语言和业务。
@@ -65,7 +67,8 @@ Codex 支持显式调用与根据 description 自动匹配；变更通常会自�
 ## 团队落地
 
 - 在项目 AGENTS.md 中保留实际构建命令、版本、目录边界和团队特例；Skill 负责可复用的工程决策。
-- 按需读取参考，日常代码交付保持简洁；只有讲解模式才展开 Bad / Good 和机制。
+- 先检索参考的目录 / 标题，首轮精读最相关的 1～2 份或小节，按必要依赖补读；只有讲解模式才展开 Bad / Good 和机制。
+- 边界与公共组件一次性承担结构校验，内部业务直接使用已校验模型；权限、状态与资源不变量仍在执行点重验。
 - 对金额、权限、并发和数据协议选择有意义的验证；低影响改动不强制补无价值测试。
 - 示例阈值、TTL、批次和容量需按业务确认；不要直接当作统一生产配置。
 - Skill 不替代编译、集成环境、性能测量和人工审查；报告只声称实际取得的证据。

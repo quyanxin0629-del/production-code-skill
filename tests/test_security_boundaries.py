@@ -2,22 +2,18 @@
 
 import asyncio
 from pathlib import Path
-import re
 from types import SimpleNamespace
 import unittest
 from uuid import UUID
+from example_support import load_example
 
 
 REFERENCE = Path(__file__).resolve().parents[1] / 'production-code/references/security-boundaries.md'
 
 
-def example(marker):
-    matches = [block for block in re.findall(r'```python\n(.*?)\n```', REFERENCE.read_text(encoding="utf-8"), re.S)
-               if marker in block]
-    if len(matches) != 1:
-        raise AssertionError(marker)
+def example(example_id):
     namespace = {}
-    exec(compile(matches[0], str(REFERENCE), 'exec'), namespace)
+    exec(compile(load_example(REFERENCE, example_id, 'python'), str(REFERENCE), 'exec'), namespace)
     return namespace
 
 
@@ -25,14 +21,14 @@ class DestinationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_provider_never_starts_network_operation(self):
         calls = []
         client = SimpleNamespace(stream=lambda *args, **kwargs: calls.append(args))
-        probe = example('async def probe_provider')['probe_provider']
+        probe = example('provider-probe-python')['probe_provider']
         for provider in ('unknown', 'https://other.example/path'):
             with self.subTest(provider=provider), self.assertRaises(ValueError):
                 await probe(client, provider, {'pricing': 'https://configured.example/health'})
         self.assertEqual(calls, [])
 
     async def test_registered_endpoint_disables_redirects_and_closes_every_exit(self):
-        probe = example('async def probe_provider')['probe_provider']
+        probe = example('provider-probe-python')['probe_provider']
         for status, failure in [(200, None), (302, None), (503, LookupError('upstream')),
                                 (200, asyncio.CancelledError('stopped'))]:
             with self.subTest(status=status, failure=type(failure)):
@@ -72,7 +68,7 @@ class DestinationTests(unittest.IsolatedAsyncioTestCase):
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_id_never_queries_or_opens(self):
-        open_blob = example('async def open_owned_blob')['open_owned_blob']
+        open_blob = example('owned-blob-python')['open_owned_blob']
         async def unexpected(*args):
             self.fail('invalid identifier reached an adapter')
         with self.assertRaises(ValueError):
@@ -81,7 +77,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                             SimpleNamespace(open_read=unexpected))
 
     async def test_ownership_filter_and_server_key_are_preserved(self):
-        open_blob = example('async def open_owned_blob')['open_owned_blob']
+        open_blob = example('owned-blob-python')['open_owned_blob']
         identifier = '12345678-1234-5678-1234-567812345678'
         queries, opened = [], []
         resource = object()
